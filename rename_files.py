@@ -1,5 +1,6 @@
 import os
 import logging
+import argparse
 
 def setup_logging(level=logging.INFO):
     """Configures logging settings."""
@@ -19,7 +20,11 @@ def rename_file(old_path, new_path, dry_run):
     else:
         try:
             os.rename(old_path, new_path)
-            logging.info(f'Renamed: {old_path} to {new_path}')
+            logging.info(f'Successfully renamed: {old_path} to {new_path}')
+        except FileNotFoundError:
+            logging.error(f'File not found: {old_path}')
+        except PermissionError:
+            logging.error(f'Permission denied: {old_path}')
         except Exception as e:
             logging.error(f'Error renaming {old_path} to {new_path}: {e}')
 
@@ -48,9 +53,18 @@ def process_directory(directory_path, dry_run=False, recursive=False):
         if not recursive:
             break
 
+def parse_arguments():
+    """Parses command-line arguments."""
+    parser = argparse.ArgumentParser(description="Rename files by replacing spaces with underscores.")
+    parser.add_argument('directory', type=str, help="Path to the directory to process.")
+    parser.add_argument('--dry-run', action='store_true', help="Log the changes without actually renaming files.")
+    parser.add_argument('--recursive', action='store_true', help="Recursively rename files in subdirectories.")
+
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    args = parse_arguments()
     setup_logging()
 
-    # Example usage
-    directory_path = 'path_to_your_directory'
-    rename_files_in_directory(directory_path, dry_run=True, recursive=True)
+    # Process the specified directory
+    process_directory(args.directory, dry_run=args.dry_run, recursive=args.recursive)
