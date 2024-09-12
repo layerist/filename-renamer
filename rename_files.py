@@ -1,12 +1,17 @@
 import os
 import logging
 import argparse
+from typing import Optional
 
-def setup_logging(level=logging.INFO):
+class DirectoryProcessingError(Exception):
+    """Custom exception for directory processing errors."""
+    pass
+
+def setup_logging(level: int = logging.INFO) -> None:
     """Configures logging settings."""
     logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def rename_file(old_path, new_path, dry_run):
+def rename_file(old_path: str, new_path: str, dry_run: bool) -> None:
     """
     Renames a file from old_path to new_path.
 
@@ -26,9 +31,9 @@ def rename_file(old_path, new_path, dry_run):
         except PermissionError:
             logging.error(f'Permission denied: {old_path}')
         except Exception as e:
-            logging.error(f'Error renaming {old_path} to {new_path}: {e}')
+            logging.exception(f'Error renaming {old_path} to {new_path}: {e}')
 
-def process_directory(directory_path, dry_run=False, recursive=False):
+def process_directory(directory_path: str, dry_run: bool = False, recursive: bool = False) -> None:
     """
     Processes a directory, renaming files by replacing spaces with underscores.
 
@@ -37,9 +42,10 @@ def process_directory(directory_path, dry_run=False, recursive=False):
     - dry_run (bool): If True, only logs the changes without renaming files.
     - recursive (bool): If True, renames files in subdirectories as well.
     """
+    directory_path = os.path.abspath(directory_path)
+
     if not os.path.isdir(directory_path):
-        logging.error(f'The directory {directory_path} does not exist or is not a directory.')
-        return
+        raise DirectoryProcessingError(f'The directory {directory_path} does not exist or is not a directory.')
 
     for root, _, files in os.walk(directory_path):
         for filename in files:
@@ -53,7 +59,7 @@ def process_directory(directory_path, dry_run=False, recursive=False):
         if not recursive:
             break
 
-def parse_arguments():
+def parse_arguments() -> argparse.Namespace:
     """Parses command-line arguments."""
     parser = argparse.ArgumentParser(description="Rename files by replacing spaces with underscores.")
     parser.add_argument('directory', type=str, help="Path to the directory to process.")
@@ -62,9 +68,17 @@ def parse_arguments():
 
     return parser.parse_args()
 
-if __name__ == "__main__":
-    args = parse_arguments()
-    setup_logging()
+def main() -> None:
+    """Main entry point of the script."""
+    try:
+        args = parse_arguments()
+        setup_logging()
 
-    # Process the specified directory
-    process_directory(args.directory, dry_run=args.dry_run, recursive=args.recursive)
+        process_directory(args.directory, dry_run=args.dry_run, recursive=args.recursive)
+    except DirectoryProcessingError as e:
+        logging.error(e)
+    except Exception as e:
+        logging.exception(f'Unexpected error: {e}')
+
+if __name__ == "__main__":
+    main()
