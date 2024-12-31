@@ -3,9 +3,11 @@ import logging
 import argparse
 from typing import Optional
 
+
 class DirectoryProcessingError(Exception):
     """Custom exception for errors during directory processing."""
     pass
+
 
 def setup_logging(level: int = logging.INFO) -> None:
     """
@@ -16,8 +18,10 @@ def setup_logging(level: int = logging.INFO) -> None:
     """
     logging.basicConfig(
         level=level,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
     )
+
 
 def rename_file(old_path: str, new_path: str, dry_run: bool) -> None:
     """
@@ -38,12 +42,9 @@ def rename_file(old_path: str, new_path: str, dry_run: bool) -> None:
         else:
             os.rename(old_path, new_path)
             logging.info(f"Renamed: {old_path} -> {new_path}")
-    except FileNotFoundError:
-        logging.error(f"File not found: {old_path}")
-    except PermissionError:
-        logging.error(f"Permission denied: {old_path}")
-    except OSError as e:
-        logging.error(f"Failed to rename {old_path} -> {new_path}: {e}")
+    except Exception as e:
+        logging.error(f"Error renaming {old_path} -> {new_path}: {e}")
+
 
 def process_directory(
     directory_path: str,
@@ -71,17 +72,13 @@ def process_directory(
                  f"(Recursive: {recursive}, Dry run: {dry_run}, File type: {file_type or 'all'})")
 
     for root, _, files in os.walk(directory_path):
-        if not files:
-            logging.debug(f"No files found in: {root}")
-            continue
-
         for filename in files:
             if filename.startswith('.'):
-                logging.debug(f"Skipped hidden file: {filename}")
+                logging.debug(f"Skipping hidden file: {filename}")
                 continue
 
             if file_type and not filename.endswith(file_type):
-                logging.debug(f"Skipped (type mismatch): {filename}")
+                logging.debug(f"Skipping due to file type mismatch: {filename}")
                 continue
 
             new_filename = filename.replace(' ', '_')
@@ -94,6 +91,7 @@ def process_directory(
             break
 
     logging.info(f"Finished processing directory: {directory_path}")
+
 
 def parse_arguments() -> argparse.Namespace:
     """
@@ -133,6 +131,7 @@ def parse_arguments() -> argparse.Namespace:
 
     return parser.parse_args()
 
+
 def main() -> None:
     """
     Main function to run the script.
@@ -152,6 +151,7 @@ def main() -> None:
         logging.error(f"Directory error: {e}")
     except Exception as e:
         logging.exception(f"Unexpected error: {e}")
+
 
 if __name__ == "__main__":
     main()
