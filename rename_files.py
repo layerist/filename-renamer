@@ -42,7 +42,7 @@ def rename_file(old_path: str, new_path: str, dry_run: bool) -> None:
         else:
             os.rename(old_path, new_path)
             logging.info(f"Renamed: {old_path} -> {new_path}")
-    except Exception as e:
+    except OSError as e:
         logging.error(f"Error renaming {old_path} -> {new_path}: {e}")
 
 
@@ -68,8 +68,10 @@ def process_directory(
     if not os.path.isdir(directory_path):
         raise DirectoryProcessingError(f"Not a directory: {directory_path}")
 
-    logging.info(f"Starting directory processing: {directory_path} "
-                 f"(Recursive: {recursive}, Dry run: {dry_run}, File type: {file_type or 'all'})")
+    logging.info(
+        f"Starting directory processing: {directory_path} "
+        f"(Recursive: {recursive}, Dry run: {dry_run}, File type: {file_type or 'all'})"
+    )
 
     for root, _, files in os.walk(directory_path):
         for filename in files:
@@ -100,7 +102,9 @@ def parse_arguments() -> argparse.Namespace:
     Returns:
         argparse.Namespace: Parsed arguments.
     """
-    parser = argparse.ArgumentParser(description="Rename files by replacing spaces with underscores.")
+    parser = argparse.ArgumentParser(
+        description="Rename files by replacing spaces with underscores."
+    )
     parser.add_argument(
         'directory',
         type=str,
