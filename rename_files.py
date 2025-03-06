@@ -1,6 +1,7 @@
 import os
 import logging
 import argparse
+import time
 from typing import Optional
 
 
@@ -12,9 +13,6 @@ class DirectoryProcessingError(Exception):
 def setup_logging(level: int = logging.INFO) -> None:
     """
     Configures the logging system.
-
-    Args:
-        level (int): Logging level (e.g., logging.INFO, logging.DEBUG).
     """
     logging.basicConfig(
         level=level,
@@ -26,19 +24,14 @@ def setup_logging(level: int = logging.INFO) -> None:
 def rename_file(old_path: str, new_path: str, dry_run: bool) -> None:
     """
     Renames a file, replacing spaces with underscores, and logs the action.
-
-    Args:
-        old_path (str): Original file path.
-        new_path (str): Desired file path.
-        dry_run (bool): If True, simulates the action without making changes.
     """
     if old_path == new_path:
-        logging.debug(f"Skipping: No renaming needed for {old_path}")
+        logging.debug(f"Skipping (No change needed): {old_path}")
         return
 
     try:
         if dry_run:
-            logging.info(f"[Dry Run] Would rename: {old_path} -> {new_path}")
+            logging.info(f"[Dry Run] Rename: {old_path} -> {new_path}")
         else:
             os.rename(old_path, new_path)
             logging.info(f"Renamed: {old_path} -> {new_path}")
@@ -54,13 +47,8 @@ def process_directory(
 ) -> None:
     """
     Processes a directory to rename files by replacing spaces with underscores.
-
-    Args:
-        directory_path (str): Path to the directory to process.
-        dry_run (bool): If True, logs actions without performing them.
-        recursive (bool): If True, processes subdirectories recursively.
-        file_type (Optional[str]): Restrict renaming to files with this extension.
     """
+    start_time = time.time()
     directory_path = os.path.abspath(directory_path)
 
     if not os.path.exists(directory_path):
@@ -68,9 +56,10 @@ def process_directory(
     if not os.path.isdir(directory_path):
         raise DirectoryProcessingError(f"Not a directory: {directory_path}")
 
+    file_type = file_type.lstrip('.') if file_type else None
+
     logging.info(
-        f"Starting directory processing: {directory_path} "
-        f"(Recursive: {recursive}, Dry run: {dry_run}, File type: {file_type or 'all'})"
+        f"Starting processing: {directory_path} (Recursive: {recursive}, Dry run: {dry_run}, File type: {file_type or 'All'})"
     )
 
     for root, _, files in os.walk(directory_path):
@@ -79,11 +68,11 @@ def process_directory(
                 logging.debug(f"Skipping hidden file: {filename}")
                 continue
 
-            if file_type and not filename.endswith(file_type):
-                logging.debug(f"Skipping due to file type mismatch: {filename}")
+            if file_type and not filename.endswith(f'.{file_type}'):
+                logging.debug(f"Skipping (File type mismatch): {filename}")
                 continue
 
-            new_filename = filename.replace(' ', '_')
+            new_filename = filename.translate(str.maketrans(" ", "_"))
             old_file_path = os.path.join(root, filename)
             new_file_path = os.path.join(root, new_filename)
 
@@ -92,18 +81,16 @@ def process_directory(
         if not recursive:
             break
 
-    logging.info(f"Finished processing directory: {directory_path}")
+    elapsed_time = time.time() - start_time
+    logging.info(f"Finished processing: {directory_path} (Elapsed time: {elapsed_time:.2f}s)")
 
 
 def parse_arguments() -> argparse.Namespace:
     """
-    Parses command-line arguments for the script.
-
-    Returns:
-        argparse.Namespace: Parsed arguments.
+    Parses command-line arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Rename files by replacing spaces with underscores."
+        description="Batch rename files by replacing spaces with underscores."
     )
     parser.add_argument(
         'directory',
@@ -122,7 +109,7 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         '--log-level',
-        type=str,
+        type=str.upper,
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         default='INFO',
         help="Set the logging level (default: INFO)."
@@ -130,7 +117,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--file-type',
         type=str,
-        help="Restrict renaming to files of this type (e.g., '.txt')."
+        help="Restrict renaming to files of this type (e.g., 'txt' for .txt files)."
     )
 
     return parser.parse_args()
@@ -141,8 +128,7 @@ def main() -> None:
     Main function to run the script.
     """
     args = parse_arguments()
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
-    setup_logging(log_level)
+    setup_logging(getattr(logging, args.log_level, logging.INFO))
 
     try:
         process_directory(
