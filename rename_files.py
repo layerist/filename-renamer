@@ -1,18 +1,18 @@
-import os
-import logging
 import argparse
+import logging
 import time
+from pathlib import Path
 from typing import Optional
 
 
 class DirectoryProcessingError(Exception):
-    """Custom exception for errors during directory processing."""
+    """Custom exception for directory processing errors."""
     pass
 
 
 def setup_logging(level: int = logging.INFO) -> None:
     """
-    Configures the logging system.
+    Configure the logging system.
     """
     logging.basicConfig(
         level=level,
@@ -21,82 +21,80 @@ def setup_logging(level: int = logging.INFO) -> None:
     )
 
 
-def rename_file(old_path: str, new_path: str, dry_run: bool) -> None:
+def rename_file(file_path: Path, dry_run: bool) -> None:
     """
-    Renames a file, replacing spaces with underscores, and logs the action.
+    Rename a file by replacing spaces with underscores.
     """
-    if old_path == new_path:
-        logging.debug(f"Skipping (No change needed): {old_path}")
+    new_name = file_path.name.replace(" ", "_")
+    new_path = file_path.with_name(new_name)
+
+    if file_path == new_path:
+        logging.debug(f"Skipping (no change): {file_path}")
         return
 
-    try:
-        if dry_run:
-            logging.info(f"[Dry Run] Rename: {old_path} -> {new_path}")
-        else:
-            os.rename(old_path, new_path)
-            logging.info(f"Renamed: {old_path} -> {new_path}")
-    except OSError as e:
-        logging.error(f"Error renaming {old_path} -> {new_path}: {e}")
+    if dry_run:
+        logging.info(f"[Dry Run] Rename: {file_path} -> {new_path}")
+    else:
+        try:
+            file_path.rename(new_path)
+            logging.info(f"Renamed: {file_path} -> {new_path}")
+        except OSError as e:
+            logging.error(f"Failed to rename {file_path}: {e}")
 
 
-def process_directory(directory_path: str, dry_run: bool = False, recursive: bool = False, file_type: Optional[str] = None) -> None:
+def process_directory(directory: Path, dry_run: bool = False, recursive: bool = False, file_type: Optional[str] = None) -> None:
     """
-    Processes a directory to rename files by replacing spaces with underscores.
+    Process a directory and rename files by replacing spaces with underscores.
     """
     start_time = time.time()
-    directory_path = os.path.abspath(directory_path)
 
-    if not os.path.isdir(directory_path):
-        raise DirectoryProcessingError(f"Invalid directory path: {directory_path}")
+    if not directory.is_dir():
+        raise DirectoryProcessingError(f"Invalid directory: {directory}")
 
-    file_type = file_type.lstrip('.') if file_type else None
+    file_type = file_type.lstrip('.').lower() if file_type else None
+    logging.info(f"Processing: {directory} (Recursive: {recursive}, Dry run: {dry_run}, File type: {file_type or 'All'})")
 
-    logging.info(f"Processing: {directory_path} (Recursive: {recursive}, Dry run: {dry_run}, File type: {file_type or 'All'})")
+    files = directory.rglob('*') if recursive else directory.glob('*')
+    for file_path in files:
+        if not file_path.is_file() or file_path.name.startswith('.'):
+            continue
 
-    for root, _, files in os.walk(directory_path):
-        for filename in files:
-            if filename.startswith('.') or (file_type and not filename.endswith(f'.{file_type}')):
-                logging.debug(f"Skipping: {filename}")
-                continue
+        if file_type and file_path.suffix.lower() != f'.{file_type}':
+            logging.debug(f"Skipping (file type mismatch): {file_path.name}")
+            continue
 
-            new_filename = filename.replace(" ", "_")
-            old_file_path = os.path.join(root, filename)
-            new_file_path = os.path.join(root, new_filename)
+        rename_file(file_path, dry_run)
 
-            rename_file(old_file_path, new_file_path, dry_run)
-
-        if not recursive:
-            break
-
-    logging.info(f"Finished processing in {time.time() - start_time:.2f}s")
+    elapsed = time.time() - start_time
+    logging.info(f"Finished processing in {elapsed:.2f}s")
 
 
 def parse_arguments() -> argparse.Namespace:
     """
-    Parses command-line arguments.
+    Parse command-line arguments.
     """
     parser = argparse.ArgumentParser(description="Batch rename files by replacing spaces with underscores.")
-    parser.add_argument('directory', type=str, help="Path to the directory to process.")
+    parser.add_argument('directory', type=Path, help="Directory path to process.")
     parser.add_argument('--dry-run', action='store_true', help="Simulate renaming without making changes.")
-    parser.add_argument('--recursive', action='store_true', help="Process files in subdirectories recursively.")
-    parser.add_argument('--log-level', type=str.upper, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default='INFO', help="Set the logging level (default: INFO).")
-    parser.add_argument('--file-type', type=str, help="Restrict renaming to files of this type (e.g., 'txt' for .txt files).")
+    parser.add_argument('--recursive', action='store_true', help="Recursively process subdirectories.")
+    parser.add_argument('--log-level', type=str.upper, choices=logging._nameToLevel.keys(), default='INFO', help="Logging level (default: INFO).")
+    parser.add_argument('--file-type', type=str, help="Filter files by extension (e.g., 'txt').")
     return parser.parse_args()
 
 
 def main() -> None:
     """
-    Main function to run the script.
+    Entry point of the script.
     """
     args = parse_arguments()
-    setup_logging(getattr(logging, args.log_level, logging.INFO))
+    setup_logging(logging._nameToLevel.get(args.log_level, logging.INFO))
 
     try:
         process_directory(args.directory, args.dry_run, args.recursive, args.file_type)
     except DirectoryProcessingError as e:
-        logging.error(f"Directory error: {e}")
+        logging.error(e)
     except Exception as e:
-        logging.exception(f"Unexpected error: {e}")
+        logging.exception("Unexpected error occurred")
 
 
 if __name__ == "__main__":
