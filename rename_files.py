@@ -13,7 +13,7 @@ class DirectoryProcessingError(Exception):
 
 def setup_logging(level: int = logging.INFO) -> None:
     """
-    Set up logging with a standardized format.
+    Configure global logging settings.
     """
     logging.basicConfig(
         level=level,
@@ -27,21 +27,21 @@ def rename_file(file_path: Path, dry_run: bool = False) -> bool:
     Rename a file by replacing spaces with underscores.
 
     Args:
-        file_path: The original file path.
-        dry_run: If True, perform a dry run without renaming.
+        file_path: Path to the file to be renamed.
+        dry_run: If True, log the renaming operation without performing it.
 
     Returns:
-        True if the file was renamed or would be renamed in dry run, else False.
+        True if the file was (or would be) renamed, False otherwise.
     """
     new_name = file_path.name.replace(" ", "_")
     if new_name == file_path.name:
-        logger.debug(f"Skipped (no rename needed): {file_path}")
+        logger.debug(f"Skipped (no spaces): {file_path}")
         return False
 
     new_path = file_path.with_name(new_name)
 
     if new_path.exists():
-        logger.warning(f"Skipped (target exists): {new_path}")
+        logger.warning(f"Skipped (target already exists): {new_path}")
         return False
 
     if dry_run:
@@ -52,8 +52,8 @@ def rename_file(file_path: Path, dry_run: bool = False) -> bool:
         file_path.rename(new_path)
         logger.info(f"Renamed: {file_path} -> {new_path}")
         return True
-    except OSError as e:
-        logger.error(f"Rename failed for {file_path}: {e}")
+    except Exception as e:
+        logger.error(f"Failed to rename {file_path}: {e}")
         return False
 
 
@@ -64,13 +64,13 @@ def process_directory(
     file_type: Optional[str] = None
 ) -> None:
     """
-    Rename files in a directory by replacing spaces with underscores.
+    Process a directory, renaming files with spaces in their names.
 
     Args:
-        directory: The target directory.
-        dry_run: If True, simulate renaming without making changes.
-        recursive: Whether to process subdirectories.
-        file_type: Optional file extension to filter files.
+        directory: Path to the directory.
+        dry_run: If True, simulate file renaming.
+        recursive: If True, include subdirectories.
+        file_type: Optional file extension filter (e.g., "jpg").
     """
     if not directory.is_dir():
         raise DirectoryProcessingError(f"Invalid directory: {directory}")
@@ -78,26 +78,26 @@ def process_directory(
     start_time = time.time()
     renamed_count = 0
     extension_filter = f".{file_type.lower()}" if file_type else None
-    files = directory.rglob("*") if recursive else directory.glob("*")
+    file_iterator = directory.rglob("*") if recursive else directory.glob("*")
 
     logger.info(f"Processing directory: {directory}")
-    logger.info(f"Options -> Dry Run: {dry_run}, Recursive: {recursive}, Filter: {extension_filter or 'All'}")
+    logger.info(f"Options -> Dry Run: {dry_run}, Recursive: {recursive}, Filter: {extension_filter or 'All files'}")
 
-    for file_path in files:
+    for file_path in file_iterator:
         if not file_path.is_file():
             continue
         if file_path.name.startswith("."):
-            logger.debug(f"Skipped (hidden file): {file_path}")
+            logger.debug(f"Skipped (hidden): {file_path}")
             continue
         if extension_filter and file_path.suffix.lower() != extension_filter:
-            logger.debug(f"Skipped (extension mismatch): {file_path}")
+            logger.debug(f"Skipped (wrong extension): {file_path}")
             continue
 
         if rename_file(file_path, dry_run):
             renamed_count += 1
 
-    duration = time.time() - start_time
-    logger.info(f"Finished. Files renamed: {renamed_count}, Time elapsed: {duration:.2f} seconds.")
+    elapsed = time.time() - start_time
+    logger.info(f"Completed. Files renamed: {renamed_count}. Elapsed time: {elapsed:.2f} seconds.")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -105,17 +105,17 @@ def parse_arguments() -> argparse.Namespace:
     Parse command-line arguments.
 
     Returns:
-        Parsed arguments namespace.
+        Parsed arguments.
     """
     parser = argparse.ArgumentParser(
         description="Batch rename files by replacing spaces with underscores."
     )
-    parser.add_argument("directory", type=Path, help="Target directory.")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate changes without renaming.")
-    parser.add_argument("--recursive", action="store_true", help="Process subdirectories recursively.")
+    parser.add_argument("directory", type=Path, help="Target directory to process.")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate changes without modifying files.")
+    parser.add_argument("--recursive", action="store_true", help="Process files recursively.")
+    parser.add_argument("--file-type", type=str, help="Filter files by extension (e.g., 'jpg').")
     parser.add_argument("--log-level", type=str.upper, choices=logging._nameToLevel.keys(),
-                        default="INFO", help="Logging level (e.g., DEBUG, INFO).")
-    parser.add_argument("--file-type", type=str, help="Only process files with this extension (e.g., jpg).")
+                        default="INFO", help="Set log level (e.g., DEBUG, INFO, WARNING).")
     return parser.parse_args()
 
 
@@ -131,12 +131,12 @@ def main() -> None:
             directory=args.directory,
             dry_run=args.dry_run,
             recursive=args.recursive,
-            file_type=args.file_type
+            file_type=args.file_type,
         )
     except DirectoryProcessingError as e:
-        logger.error(e)
+        logger.error(str(e))
     except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
+        logger.exception(f"Unhandled error: {e}")
 
 
 if __name__ == "__main__":
