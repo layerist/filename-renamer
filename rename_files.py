@@ -2,7 +2,12 @@ import argparse
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 logger = logging.getLogger(__name__)
 
@@ -26,34 +31,26 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
-def sanitize_filename(name: str, replace_space: bool = True) -> str:
+def sanitize_filename(name: str, replacement: str = "_") -> str:
     """
-    Sanitize file name (replace spaces, trim).
+    Sanitize a filename by replacing spaces and trimming.
     """
-    new_name = name
-    if replace_space:
-        new_name = new_name.replace(" ", "_")
-    return new_name.strip()
+    return name.replace(" ", replacement).strip()
 
 
-def rename_file(file_path: Path, dry_run: bool = False) -> bool:
+def rename_file(file_path: Path, replacement: str = "_", dry_run: bool = False) -> bool:
     """
     Rename a file by sanitizing its name.
-
-    Args:
-        file_path: Path to the file to be renamed.
-        dry_run: If True, log the renaming operation without performing it.
 
     Returns:
         True if the file was (or would be) renamed, False otherwise.
     """
-    new_name = sanitize_filename(file_path.name)
+    new_name = sanitize_filename(file_path.name, replacement)
     if new_name == file_path.name:
         logger.debug(f"Skipped (already clean): {file_path}")
         return False
 
     new_path = file_path.with_name(new_name)
-
     if new_path.exists():
         logger.warning(f"Skipped (target exists): {new_path}")
         return False
@@ -77,16 +74,12 @@ def process_directory(
     directory: Path,
     dry_run: bool = False,
     recursive: bool = False,
-    file_type: Optional[str] = None
+    file_types: Optional[Sequence[str]] = None,
+    replacement: str = "_",
+    case_insensitive: bool = True,
 ) -> None:
     """
     Process a directory, renaming files with spaces in their names.
-
-    Args:
-        directory: Path to the directory.
-        dry_run: If True, simulate file renaming.
-        recursive: If True, include subdirectories.
-        file_type: Optional file extension filter (e.g., "jpg").
     """
     directory = directory.resolve()
     if not directory.is_dir():
@@ -96,26 +89,33 @@ def process_directory(
     renamed_count = 0
     scanned_count = 0
 
-    extension_filter = f".{file_type.lower()}" if file_type else None
+    if file_types:
+        file_types = [f".{ft.lstrip('.').lower()}" for ft in file_types]
+
     file_iterator = directory.rglob("*") if recursive else directory.glob("*")
+    iterable = tqdm(file_iterator, desc="Processing") if tqdm else file_iterator
 
     logger.info(f"Processing directory: {directory}")
     logger.info(
-        f"Options -> Dry Run: {dry_run}, Recursive: {recursive}, Filter: {extension_filter or 'All files'}"
+        f"Options -> Dry Run: {dry_run}, Recursive: {recursive}, "
+        f"Filter: {', '.join(file_types) if file_types else 'All files'}"
     )
 
-    for file_path in file_iterator:
+    for file_path in iterable:
         if not file_path.is_file():
             continue
         if file_path.name.startswith("."):
             logger.debug(f"Skipped (hidden): {file_path}")
             continue
-        if extension_filter and file_path.suffix.lower() != extension_filter:
-            logger.debug(f"Skipped (wrong extension): {file_path}")
-            continue
+
+        if file_types:
+            suffix = file_path.suffix.lower() if case_insensitive else file_path.suffix
+            if suffix not in file_types:
+                logger.debug(f"Skipped (wrong extension): {file_path}")
+                continue
 
         scanned_count += 1
-        if rename_file(file_path, dry_run):
+        if rename_file(file_path, replacement=replacement, dry_run=dry_run):
             renamed_count += 1
 
     elapsed = time.time() - start_time
@@ -129,14 +129,35 @@ def parse_arguments() -> argparse.Namespace:
     Parse command-line arguments.
     """
     parser = argparse.ArgumentParser(
-        description="Batch rename files by replacing spaces with underscores."
+        description="Batch rename files by replacing spaces in filenames."
     )
     parser.add_argument("directory", type=Path, help="Target directory to process.")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate changes without modifying files.")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Simulate changes without modifying files."
+    )
     parser.add_argument("--recursive", action="store_true", help="Process files recursively.")
-    parser.add_argument("--file-type", type=str, help="Filter files by extension (e.g., 'jpg').")
-    parser.add_argument("--log-level", type=str, default="INFO",
-                        help="Set log level (DEBUG, INFO, WARNING, ERROR).")
+    parser.add_argument(
+        "--file-types",
+        type=lambda s: [ft.strip() for ft in s.split(",")],
+        help="Filter files by extension(s), e.g., 'jpg,png,txt'.",
+    )
+    parser.add_argument(
+        "--replacement",
+        type=str,
+        default="_",
+        help="Replacement character for spaces (default: '_').",
+    )
+    parser.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="Make file extension filtering case-sensitive.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Set log level (DEBUG, INFO, WARNING, ERROR).",
+    )
     return parser.parse_args()
 
 
@@ -152,7 +173,9 @@ def main() -> None:
             directory=args.directory,
             dry_run=args.dry_run,
             recursive=args.recursive,
-            file_type=args.file_type,
+            file_types=args.file_types,
+            replacement=args.replacement,
+            case_insensitive=not args.case_sensitive,
         )
     except DirectoryProcessingError as e:
         logger.error(str(e))
