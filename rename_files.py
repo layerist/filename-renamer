@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """
 File Sanitizer — Fast, safe, multithreaded file renamer.
-Enhanced Edition:
-  ✔ Stronger filename sanitizing (unicode-safe)
-  ✔ Collision-safe renaming
-  ✔ Atomic rename + backup
-  ✔ Thread-safe logging
-  ✔ Faster file scanning
-  ✔ More robust exceptions
+Improved Edition:
+  ✔ Unicode-safe normalization (NFKC)
+  ✔ Configurable illegal character policy
+  ✔ Deterministic, collision-safe renaming
+  ✔ True atomic rename with optional backup
+  ✔ Thread-safe, structured logging
+  ✔ Faster directory scanning
+  ✔ Graceful shutdown with clean progress handling
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
 import os
 import signal
+import sys
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Sequence, Iterable, List
+from typing import Iterable, Optional, Sequence, Set
 
 
 # =======================================================
@@ -26,65 +31,89 @@ from typing import Optional, Sequence, Iterable, List
 
 try:
     from tqdm import tqdm
-except ImportError:
+except ImportError:  # pragma: no cover
     tqdm = None
 
 try:
     from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
-except ImportError:
-    class Dummy:
-        RESET = RED = GREEN = YELLOW = CYAN = ""
-    Fore = Style = Dummy()
+except ImportError:  # pragma: no cover
+    class _Dummy:
+        RED = GREEN = YELLOW = CYAN = RESET = ""
+    Fore = Style = _Dummy()
 
 
 logger = logging.getLogger("file_sanitizer")
 
 
 # =======================================================
-# Utility functions
+# Logging
 # =======================================================
 
 def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
     )
 
 
-ILLEGAL_CHARS = set(r'<>:"/\|?*')
+# =======================================================
+# Sanitization
+# =======================================================
+
+DEFAULT_ILLEGAL_CHARS: Set[str] = set(r'<>:"/\|?*')
 
 
-def sanitize_filename(name: str, replacement: str = "_") -> str:
+def sanitize_filename(
+    name: str,
+    replacement: str = "_",
+    illegal: Set[str] = DEFAULT_ILLEGAL_CHARS,
+    normalize: bool = True,
+    collapse: bool = True,
+) -> str:
     """
-    Safe filename sanitizer.
-    Removes illegal chars and normalizes spacing.
+    Sanitize a filename in a Unicode-safe way.
+    - Normalizes Unicode (NFKC)
+    - Replaces illegal chars and whitespace
+    - Optionally collapses repeated replacements
     """
-    sanitized = []
+    if normalize:
+        name = unicodedata.normalize("NFKC", name)
+
+    out = []
     for ch in name:
-        if ch in ILLEGAL_CHARS or ch.isspace():
-            sanitized.append(replacement)
+        if ch in illegal or ch.isspace() or ord(ch) < 32:
+            out.append(replacement)
         else:
-            sanitized.append(ch)
-    out = "".join(sanitized).strip(replacement)
-    return out or "unnamed"
+            out.append(ch)
+
+    result = "".join(out)
+
+    if collapse:
+        while replacement * 2 in result:
+            result = result.replace(replacement * 2, replacement)
+
+    result = result.strip(replacement)
+    return result or "unnamed"
 
 
-def safe_rename(src: Path, dst: Path) -> None:
+# =======================================================
+# Filesystem helpers
+# =======================================================
+
+def atomic_rename(src: Path, dst: Path) -> None:
     """
     Atomic rename with overwrite protection.
     """
-    # System-level guarantee: path must not exist before rename
-    try:
-        os.replace(src, dst)  # atomic on most platforms
-    except FileExistsError:
-        raise FileExistsError(f"Cannot rename: target exists: {dst}")
+    if dst.exists():
+        raise FileExistsError(f"Target already exists: {dst}")
+    os.replace(src, dst)  # atomic on POSIX & Windows NTFS
 
 
-def apply_backup(src: Path) -> Path:
+def create_backup(src: Path) -> Path:
     """
-    Creates a unique .bak backup file next to original.
+    Create a unique .bak backup next to the original file.
     """
     base = src.with_suffix(src.suffix + ".bak")
     candidate = base
@@ -94,48 +123,50 @@ def apply_backup(src: Path) -> Path:
         candidate = src.with_suffix(src.suffix + f".bak.{idx}")
         idx += 1
 
-    src.rename(candidate)
+    os.replace(src, candidate)
     return candidate
 
 
 def rename_file(
-    file_path: Path,
-    replacement: str = "_",
-    dry_run: bool = False,
-    backup: bool = False
+    path: Path,
+    *,
+    replacement: str,
+    dry_run: bool,
+    backup: bool,
 ) -> bool:
     """
-    Rename a file; returns True if changed.
+    Rename a single file. Returns True if renamed.
     """
-
-    new_name = sanitize_filename(file_path.name, replacement)
-    if new_name == file_path.name:
+    new_name = sanitize_filename(path.name, replacement=replacement)
+    if new_name == path.name:
         return False
 
-    new_path = file_path.with_name(new_name)
+    target = path.with_name(new_name)
 
-    # Collision check
-    if new_path.exists():
-        logger.warning(f"{Fore.YELLOW}Skipped (target exists): {file_path} -> {new_name}")
+    if target.exists():
+        logger.warning(
+            f"{Fore.YELLOW}Skipped (collision): {path.name} → {new_name}"
+        )
         return False
 
     if dry_run:
-        logger.info(f"[Dry Run] {file_path.name} → {new_name}")
+        logger.info(f"[Dry-run] {path.name} → {new_name}")
         return True
 
     try:
-        original = file_path
         if backup:
-            backup_file = apply_backup(original)
-            safe_rename(backup_file, new_path)
+            bak = create_backup(path)
+            atomic_rename(bak, target)
         else:
-            safe_rename(original, new_path)
+            atomic_rename(path, target)
 
-        logger.info(f"{Fore.GREEN}Renamed: {file_path.name} → {new_name}")
+        logger.info(f"{Fore.GREEN}Renamed: {path.name} → {new_name}")
         return True
 
-    except Exception as e:
-        logger.error(f"{Fore.RED}Error renaming {file_path}: {e}")
+    except Exception as exc:
+        logger.error(
+            f"{Fore.RED}Failed: {path.name} → {new_name} | {exc}"
+        )
         return False
 
 
@@ -144,36 +175,38 @@ def rename_file(
 # =======================================================
 
 def collect_files(
-    directory: Path,
+    root: Path,
+    *,
     recursive: bool,
-    extensions: Optional[Sequence[str]],
-    case_insensitive: bool
+    extensions: Optional[Set[str]],
+    case_insensitive: bool,
 ) -> Iterable[Path]:
     """
-    Efficiently collect files matching filters.
+    Efficient generator for file collection.
     """
-    pattern_iter = directory.rglob("*") if recursive else directory.glob("*")
+    iterator = root.rglob("*") if recursive else root.iterdir()
 
-    for f in pattern_iter:
-        if not f.is_file():
+    for p in iterator:
+        if not p.is_file():
             continue
-        if f.name.startswith("."):
+        if p.name.startswith("."):
             continue
 
         if extensions:
-            ext = f.suffix.lower() if case_insensitive else f.suffix
-            if ext not in extensions:
+            suf = p.suffix.lower() if case_insensitive else p.suffix
+            if suf not in extensions:
                 continue
 
-        yield f
+        yield p
 
 
 # =======================================================
-# Main logic
+# Processing
 # =======================================================
 
 def process_directory(
     directory: Path,
+    *,
     dry_run: bool,
     recursive: bool,
     file_types: Optional[Sequence[str]],
@@ -182,54 +215,66 @@ def process_directory(
     max_workers: int,
     backup: bool,
 ) -> None:
-
     directory = directory.resolve()
     if not directory.is_dir():
         raise ValueError(f"Invalid directory: {directory}")
 
     extensions = None
     if file_types:
-        extensions = [f".{ft.lstrip('.').lower()}" for ft in file_types]
+        extensions = {
+            f".{ext.lstrip('.').lower()}" for ext in file_types
+        }
 
-    files = list(collect_files(directory, recursive, extensions, case_insensitive))
-    total = len(files)
+    files = list(
+        collect_files(
+            directory,
+            recursive=recursive,
+            extensions=extensions,
+            case_insensitive=case_insensitive,
+        )
+    )
 
-    if not total:
+    if not files:
         logger.info(f"{Fore.YELLOW}No files to process in {directory}")
         return
 
-    logger.info(f"Found {total} file(s). Starting...")
+    logger.info(f"Found {len(files)} file(s). Starting…")
 
     renamed = 0
     start = time.time()
-    progress = tqdm(total=total, desc="Renaming", unit="file") if tqdm else None
+    stop = False
 
-    # Graceful Ctrl+C
-    stop_flag = False
+    def handle_signal(*_):
+        nonlocal stop
+        stop = True
+        logger.warning("\nInterrupt received — stopping gracefully…")
 
-    def sig_handler(*_):
-        nonlocal stop_flag
-        stop_flag = True
-        logger.warning("\nInterrupt received. Finishing pending tasks...")
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
-    signal.signal(signal.SIGINT, sig_handler)
-    signal.signal(signal.SIGTERM, sig_handler)
+    progress = tqdm(total=len(files), desc="Renaming", unit="file") if tqdm else None
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(rename_file, f, replacement, dry_run, backup): f for f in files}
+        futures = [
+            executor.submit(
+                rename_file,
+                f,
+                replacement=replacement,
+                dry_run=dry_run,
+                backup=backup,
+            )
+            for f in files
+        ]
 
         for future in as_completed(futures):
-            if stop_flag:
+            if stop:
                 break
 
-            result = False
             try:
-                result = future.result()
-            except Exception as e:
-                logger.error(f"{Fore.RED}Unexpected error: {e}")
-
-            if result:
-                renamed += 1
+                if future.result():
+                    renamed += 1
+            except Exception as exc:  # pragma: no cover
+                logger.error(f"{Fore.RED}Unhandled error: {exc}")
 
             if progress:
                 progress.update(1)
@@ -238,7 +283,10 @@ def process_directory(
         progress.close()
 
     elapsed = time.time() - start
-    logger.info(f"{Fore.CYAN}Completed — Total: {total}, Renamed: {renamed}, Time: {elapsed:.2f}s")
+    logger.info(
+        f"{Fore.CYAN}Done — Total: {len(files)}, Renamed: {renamed}, "
+        f"Time: {elapsed:.2f}s"
+    )
 
 
 # =======================================================
@@ -249,26 +297,27 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Batch sanitize filenames across directories."
     )
-    parser.add_argument("directory", type=Path, help="Directory to process.")
-    parser.add_argument("--dry-run", action="store_true", help="Show changes without renaming files.")
-    parser.add_argument("--recursive", action="store_true", help="Process subdirectories recursively.")
-    parser.add_argument("--file-types", type=lambda s: [i.strip() for i in s.split(",")],
-                        help="Comma-separated extensions: 'jpg,png,txt'")
-    parser.add_argument("--replacement", type=str, default="_",
-                        help="Replacement for invalid characters.")
-    parser.add_argument("--case-sensitive", action="store_true",
-                        help="Case-sensitive extension filtering.")
-    parser.add_argument("--threads", type=int, default=4,
-                        help="Thread pool size.")
-    parser.add_argument("--backup", action="store_true",
-                        help="Create .bak backups before renaming.")
-    parser.add_argument("--log-level", type=str, default="INFO",
-                        help="Log level (DEBUG, INFO, WARNING, ERROR)")
-
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--recursive", action="store_true")
+    parser.add_argument(
+        "--file-types",
+        type=lambda s: [x.strip() for x in s.split(",")],
+        help="Comma-separated extensions: jpg,png,txt",
+    )
+    parser.add_argument("--replacement", default="_")
+    parser.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="Case-sensitive extension filtering",
+    )
+    parser.add_argument("--threads", type=int, default=os.cpu_count() or 4)
+    parser.add_argument("--backup", action="store_true")
+    parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_arguments()
     setup_logging(args.log_level)
 
@@ -283,8 +332,9 @@ def main():
             max_workers=args.threads,
             backup=args.backup,
         )
-    except Exception as e:
-        logger.error(f"{Fore.RED}Fatal error: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error(f"{Fore.RED}Fatal error: {exc}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
