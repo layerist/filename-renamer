@@ -7,9 +7,10 @@ Enhancements:
   ✔ Deterministic collision resolution (_1, _2, …)
   ✔ Atomic renames with optional backup
   ✔ Signal-safe graceful shutdown
-  ✔ Faster directory scanning
+  ✔ Faster directory scanning (os.scandir)
   ✔ Thread-safe structured logging
   ✔ Clear separation of concerns
+  ✔ Improved error handling and validation
 """
 
 from __future__ import annotations
@@ -43,8 +44,14 @@ except ImportError:  # pragma: no cover
         RED = GREEN = YELLOW = CYAN = ""
     Fore = _Dummy()
 
+# =======================================================
+# Globals
+# =======================================================
+
 logger = logging.getLogger("file_sanitizer")
 stop_event = Event()
+
+DEFAULT_ILLEGAL_CHARS: Set[str] = set(r'<>:"/\|?*')
 
 # =======================================================
 # Logging
@@ -61,27 +68,30 @@ def setup_logging(level: str) -> None:
 # Sanitization
 # =======================================================
 
-DEFAULT_ILLEGAL_CHARS: Set[str] = set(r'<>:"/\|?*')
-
 def sanitize_filename(
     name: str,
     *,
     replacement: str,
     illegal: Set[str] = DEFAULT_ILLEGAL_CHARS,
 ) -> str:
+    """
+    Normalize and sanitize a filename.
+    """
     name = unicodedata.normalize("NFKC", name)
 
-    cleaned = []
+    out = []
     for ch in name:
         if ch in illegal or ch.isspace() or ord(ch) < 32:
-            cleaned.append(replacement)
+            out.append(replacement)
         else:
-            cleaned.append(ch)
+            out.append(ch)
 
-    result = "".join(cleaned)
+    result = "".join(out)
 
-    while replacement * 2 in result:
-        result = result.replace(replacement * 2, replacement)
+    # Collapse repeated replacements
+    double = replacement * 2
+    while double in result:
+        result = result.replace(double, replacement)
 
     result = result.strip(replacement)
     return result or "unnamed"
@@ -101,19 +111,19 @@ def unique_target(path: Path) -> Path:
     if not path.exists():
         return path
 
-    stem, suffix = path.stem, path.suffix
     parent = path.parent
-    i = 1
+    stem = path.stem
+    suffix = path.suffix
+    index = 1
 
     while True:
-        candidate = parent / f"{stem}_{i}{suffix}"
+        candidate = parent / f"{stem}_{index}{suffix}"
         if not candidate.exists():
             return candidate
-        i += 1
+        index += 1
 
 def create_backup(src: Path) -> Path:
-    bak = src.with_suffix(src.suffix + ".bak")
-    return unique_target(bak)
+    return unique_target(src.with_suffix(src.suffix + ".bak"))
 
 # =======================================================
 # Rename operation
@@ -167,26 +177,35 @@ def collect_files(
     extensions: Optional[Set[str]],
     case_insensitive: bool,
 ) -> Iterable[Path]:
+    """
+    Efficient, non-recursive directory traversal using an explicit stack.
+    """
     stack = [root]
 
-    while stack:
+    while stack and not stop_event.is_set():
         current = stack.pop()
         try:
-            for entry in os.scandir(current):
-                if entry.is_dir(follow_symlinks=False) and recursive:
-                    stack.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False):
-                    name = entry.name
-                    if name.startswith("."):
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        if recursive:
+                            stack.append(Path(entry.path))
+                        continue
+
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+
+                    if entry.name.startswith("."):
                         continue
 
                     if extensions:
-                        suffix = Path(name).suffix
+                        suffix = Path(entry.name).suffix
                         suffix = suffix.lower() if case_insensitive else suffix
                         if suffix not in extensions:
                             continue
 
                     yield Path(entry.path)
+
         except PermissionError:
             logger.warning(f"{Fore.YELLOW}Skipped (permission): {current}")
 
@@ -211,7 +230,7 @@ def process_directory(
 
     extensions = None
     if file_types:
-        extensions = {f".{e.lstrip('.').lower()}" for e in file_types}
+        extensions = {f".{ext.lstrip('.').lower()}" for ext in file_types}
 
     files = list(
         collect_files(
@@ -228,13 +247,13 @@ def process_directory(
 
     logger.info(f"Found {len(files)} file(s). Processing…")
 
-    start = time.time()
+    start = time.perf_counter()
     renamed = 0
 
     progress = tqdm(total=len(files), unit="file", desc="Renaming") if tqdm else None
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
+        futures = (
             executor.submit(
                 rename_file,
                 f,
@@ -243,7 +262,7 @@ def process_directory(
                 backup=backup,
             )
             for f in files
-        ]
+        )
 
         for future in as_completed(futures):
             if stop_event.is_set():
@@ -261,7 +280,7 @@ def process_directory(
     if progress:
         progress.close()
 
-    elapsed = time.time() - start
+    elapsed = time.perf_counter() - start
     logger.info(
         f"{Fore.CYAN}Done — Total: {len(files)}, Renamed: {renamed}, "
         f"Time: {elapsed:.2f}s"
@@ -303,7 +322,7 @@ def main() -> None:
             file_types=args.file_types,
             replacement=args.replacement,
             case_insensitive=not args.case_sensitive,
-            max_workers=args.threads,
+            max_workers=max(1, args.threads),
             backup=args.backup,
         )
     except Exception as exc:
