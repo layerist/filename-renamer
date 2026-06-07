@@ -177,7 +177,7 @@ def safe_rename(src: str, dst: str) -> str:
 
     while True:
         try:
-            os.rename(src, candidate)
+            os.replace(src, candidate)
             return candidate
 
         except FileExistsError:
@@ -567,10 +567,7 @@ def handle_signal(*_):
 
 def main():
 
-    global (
-        TRANSLATION_TABLE,
-        RE_MULTI_REPLACE,
-    )
+    global TRANSLATION_TABLE, RE_MULTI_REPLACE
 
     args = parse_arguments()
 
