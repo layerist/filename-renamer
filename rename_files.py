@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-File Sanitizer — fast, no-overwrite, multithreaded filename sanitizer.
+File Sanitizer v2 — safe and predictable batch filename sanitizer.
 
-What it does:
-- scans a directory for regular files;
-- sanitizes unsafe filenames;
-- renames files without overwriting existing files;
-- supports dry-run, backups, extension filters, recursion and progress bar;
-- handles Ctrl+C gracefully.
+Key properties:
+- never intentionally overwrites an existing file;
+- plans collision-free names before execution, so dry-run matches real output;
+- supports recursive scan, extension filters, backups and parallel execution;
+- preserves file extensions while enforcing a configurable filename limit;
+- handles Windows reserved names and trailing spaces/dots;
+- stops cleanly on Ctrl+C and returns a meaningful exit code.
+
+Python: 3.9+
+Optional: tqdm, colorama
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import logging
 import os
-import queue
 import re
 import shutil
 import signal
@@ -24,9 +28,10 @@ import sys
 import threading
 import time
 import unicodedata
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Iterator, Optional, Sequence, Set
+from pathlib import Path
+from typing import Iterable, Iterator, Optional, Sequence
 
 try:
     from tqdm import tqdm
@@ -43,49 +48,49 @@ except ImportError:  # pragma: no cover
 
     Fore = _Dummy()
 
-logger = logging.getLogger("file_sanitizer")
-stop_event = threading.Event()
+LOGGER = logging.getLogger("file_sanitizer")
+STOP_EVENT = threading.Event()
 
-DEFAULT_ILLEGAL_CHARS: Set[str] = set(r'<>:"/\\|?*')
-WINDOWS_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-RE_SPACES = re.compile(r"\s+")
+ILLEGAL_CHARS = frozenset('<>:"/\\|?*')
+WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+WHITESPACE_RE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True)
 class SanitizerConfig:
     replacement: str = "_"
     max_length: int = 255
-    keep_hidden: bool = False
     normalize_unicode: bool = True
+    preserve_leading_dot: bool = False
+    case_insensitive_collisions: bool = os.name == "nt"
+
+
+@dataclass(frozen=True)
+class RenamePlan:
+    source: Path
+    target: Path
 
 
 @dataclass(frozen=True)
 class RenameResult:
-    changed: bool
-    old_path: str
-    new_path: str
+    source: Path
+    target: Path
+    renamed: bool
+    backup_path: Optional[Path] = None
+    error: Optional[str] = None
 
 
-class Counter:
-    __slots__ = ("processed", "renamed", "failed", "_lock")
-
-    def __init__(self) -> None:
-        self.processed = 0
-        self.renamed = 0
-        self.failed = 0
-        self._lock = threading.Lock()
-
-    def flush(self, processed_delta: int, renamed_delta: int, failed_delta: int) -> None:
-        if not processed_delta and not renamed_delta and not failed_delta:
-            return
-        with self._lock:
-            self.processed += processed_delta
-            self.renamed += renamed_delta
-            self.failed += failed_delta
+@dataclass
+class Statistics:
+    discovered: int = 0
+    unchanged: int = 0
+    planned: int = 0
+    renamed: int = 0
+    failed: int = 0
 
 
 def setup_logging(level: str) -> None:
@@ -97,427 +102,502 @@ def setup_logging(level: str) -> None:
 
 
 def validate_replacement(value: str) -> str:
-    if any(ch in DEFAULT_ILLEGAL_CHARS for ch in value):
-        raise ValueError(
-            f"Replacement must not contain illegal filename chars: {sorted(DEFAULT_ILLEGAL_CHARS)}"
+    if any(ch in ILLEGAL_CHARS for ch in value):
+        raise argparse.ArgumentTypeError(
+            "replacement contains an illegal filename character"
         )
-    if any(ord(ch) < 32 for ch in value):
-        raise ValueError("Replacement must not contain control characters")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise argparse.ArgumentTypeError(
+            "replacement must not contain control characters"
+        )
+    if value in {".", ".."}:
+        raise argparse.ArgumentTypeError("replacement cannot be '.' or '..'")
     return value
 
 
-def build_translation_table(replacement: str) -> dict[int, str]:
-    table = {ord(ch): replacement for ch in DEFAULT_ILLEGAL_CHARS}
-    table.update({i: replacement for i in range(32)})
-    return table
-
-
-def normalize_extensions(file_types: Optional[Sequence[str]]) -> Optional[Set[str]]:
-    if not file_types:
+def normalize_extensions(values: Optional[Sequence[str]]) -> Optional[frozenset[str]]:
+    if not values:
         return None
 
-    result: Set[str] = set()
-    for item in file_types:
-        for ext in item.split(","):
-            ext = ext.strip().lower()
-            if not ext:
-                continue
-            result.add("." + ext.lstrip("."))
-    return result or None
+    result: set[str] = set()
+    for value in values:
+        for item in value.split(","):
+            item = item.strip().casefold()
+            if item:
+                result.add("." + item.lstrip("."))
+    return frozenset(result) or None
 
 
-def make_candidate_name(stem: str, suffix: str, index: int, max_length: int) -> str:
-    extra = f"_{index}"
-    allowed_stem_len = max(1, max_length - len(suffix) - len(extra))
-    return f"{stem[:allowed_stem_len]}{extra}{suffix}"
+def split_filename(name: str) -> tuple[str, str]:
+    """Split a filename while treating dotfiles such as '.env' as extensionless."""
+    if name.startswith(".") and name.count(".") == 1:
+        return name, ""
+    stem, suffix = os.path.splitext(name)
+    return stem, suffix
 
 
-def _sanitize_uncached(name: str, cfg: SanitizerConfig, translation_table: dict[int, str]) -> str:
-    result = unicodedata.normalize("NFKC", name) if cfg.normalize_unicode else name
-    result = result.translate(translation_table)
-    result = RE_SPACES.sub(cfg.replacement, result)
+def truncate_filename(stem: str, suffix: str, max_length: int, extra: str = "") -> str:
+    """Apply a character limit while retaining suffix and collision marker."""
+    suffix_budget = len(suffix) + len(extra)
+    if suffix_budget >= max_length:
+        # Extremely long extension: keep a minimal stem and the rightmost suffix part.
+        suffix = suffix[-max(0, max_length - len(extra) - 1):]
+        return f"x{extra}{suffix}"[:max_length]
+
+    allowed = max_length - suffix_budget
+    return f"{stem[:allowed]}{extra}{suffix}"
+
+
+def sanitize_filename(name: str, cfg: SanitizerConfig) -> str:
+    leading_dot = cfg.preserve_leading_dot and name.startswith(".")
+    working = name[1:] if leading_dot else name
+
+    if cfg.normalize_unicode:
+        working = unicodedata.normalize("NFKC", working)
+
+    translated = []
+    for char in working:
+        codepoint = ord(char)
+        if char in ILLEGAL_CHARS or codepoint < 32 or codepoint == 127:
+            translated.append(cfg.replacement)
+        else:
+            translated.append(char)
+    working = "".join(translated)
+    working = WHITESPACE_RE.sub(cfg.replacement, working)
 
     if cfg.replacement:
-        result = re.sub(re.escape(cfg.replacement) + r"+", cfg.replacement, result)
-        result = result.strip(cfg.replacement)
+        working = re.sub(
+            f"(?:{re.escape(cfg.replacement)})+",
+            cfg.replacement,
+            working,
+        ).strip(cfg.replacement)
 
-    result = result.rstrip(" .")
+    # Windows forbids trailing spaces and dots; applying this everywhere makes
+    # output portable and avoids surprising names.
+    working = working.rstrip(" .")
+    if not working:
+        working = "unnamed"
 
-    if not result:
+    stem, suffix = split_filename(working)
+    if stem.upper() in WINDOWS_RESERVED:
+        stem = f"_{stem}"
+
+    result = truncate_filename(stem, suffix, cfg.max_length)
+    if leading_dot:
+        # The leading dot counts towards the limit.
+        result = "." + result[: max(1, cfg.max_length - 1)]
+
+    if result in {"", ".", ".."}:
         result = "unnamed"
-
-    stem, suffix = os.path.splitext(result)
-    if os.name == "nt" and stem.upper() in WINDOWS_RESERVED:
-        result = f"_{result}"
-        stem, suffix = os.path.splitext(result)
-
-    if len(result) > cfg.max_length:
-        allowed_stem_len = max(1, cfg.max_length - len(suffix))
-        result = f"{stem[:allowed_stem_len]}{suffix}"
-
     return result
 
 
-@lru_cache(maxsize=200_000)
-def _sanitize_cached(
-    name: str,
-    replacement: str,
-    max_length: int,
-    keep_hidden: bool,
-    normalize_unicode: bool,
-    translation_items: tuple[tuple[int, str], ...],
-) -> str:
-    cfg = SanitizerConfig(
-        replacement=replacement,
-        max_length=max_length,
-        keep_hidden=keep_hidden,
-        normalize_unicode=normalize_unicode,
-    )
-    return _sanitize_uncached(name, cfg, dict(translation_items))
+def collision_key(path: Path, case_insensitive: bool) -> str:
+    value = os.path.abspath(os.fspath(path))
+    return value.casefold() if case_insensitive else value
 
 
-def sanitize_filename(name: str, cfg: SanitizerConfig, translation_table: dict[int, str]) -> str:
-    return _sanitize_cached(
-        name,
-        cfg.replacement,
-        cfg.max_length,
-        cfg.keep_hidden,
-        cfg.normalize_unicode,
-        tuple(sorted(translation_table.items())),
-    )
+def candidate_name(base_name: str, index: int, max_length: int) -> str:
+    stem, suffix = split_filename(base_name)
+    return truncate_filename(stem, suffix, max_length, extra=f"_{index}")
 
 
-def link_then_unlink(src: str, dst: str) -> None:
-    """
-    No-overwrite rename for regular files on the same filesystem.
-
-    os.link() atomically creates the destination only if it does not exist.
-    Then os.unlink() removes the old directory entry. This avoids the main
-    os.replace()/POSIX os.rename() problem: silent overwrite of existing files.
-    """
-    os.link(src, dst)
-    try:
-        os.unlink(src)
-    except Exception:
-        # Roll back the newly created hardlink if the old name could not be removed.
-        try:
-            os.unlink(dst)
-        finally:
-            raise
-
-
-def safe_rename_no_overwrite(src: str, dst: str, *, max_attempts: int = 10_000) -> str:
-    directory = os.path.dirname(dst)
-    filename = os.path.basename(dst)
-    stem, suffix = os.path.splitext(filename)
-
-    candidate = dst
-    for index in range(max_attempts + 1):
-        if index:
-            candidate = os.path.join(
-                directory,
-                make_candidate_name(stem, suffix, index, 255),
-            )
-
-        try:
-            link_then_unlink(src, candidate)
-            return candidate
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            # Windows / FS fallback: os.rename() refuses to overwrite on Windows.
-            # On POSIX, use this fallback only after an explicit existence check.
-            if os.name == "nt" and getattr(exc, "winerror", None) in {183}:
-                continue
-            if not os.path.exists(candidate):
-                try:
-                    os.rename(src, candidate)
-                    return candidate
-                except FileExistsError:
-                    continue
-            raise
-
-    raise FileExistsError(f"Could not find free destination name for: {dst}")
-
-
-def make_backup(filepath: str) -> str:
-    backup_path = f"{filepath}.bak"
-    if not os.path.exists(backup_path):
-        shutil.copy2(filepath, backup_path)
-        return backup_path
-
-    dirname = os.path.dirname(backup_path)
-    filename = os.path.basename(backup_path)
-    stem, suffix = os.path.splitext(filename)
-
-    for index in range(1, 10_000):
-        candidate = os.path.join(dirname, f"{stem}_{index}{suffix}")
-        if not os.path.exists(candidate):
-            shutil.copy2(filepath, candidate)
-            return candidate
-
-    raise FileExistsError(f"Could not create backup for: {filepath}")
-
-
-def rename_file(
-    filepath: str,
-    *,
-    cfg: SanitizerConfig,
-    translation_table: dict[int, str],
-    dry_run: bool,
-    backup: bool,
-) -> RenameResult:
-    dirname = os.path.dirname(filepath)
-    old_name = os.path.basename(filepath)
-    new_name = sanitize_filename(old_name, cfg, translation_table)
-
-    if old_name == new_name:
-        return RenameResult(False, filepath, filepath)
-
-    target = os.path.join(dirname, new_name)
-
-    try:
-        if os.path.samefile(filepath, target):
-            return RenameResult(False, filepath, filepath)
-    except OSError:
-        pass
-
-    if dry_run:
-        logger.info("[Dry-run] %s → %s", old_name, new_name)
-        return RenameResult(True, filepath, target)
-
-    if backup:
-        make_backup(filepath)
-
-    final_path = safe_rename_no_overwrite(filepath, target)
-    logger.info("%sRenamed: %s → %s", Fore.GREEN, old_name, os.path.basename(final_path))
-    return RenameResult(True, filepath, final_path)
-
-
-def collect_files(
-    root: str,
+def iter_files(
+    root: Path,
     *,
     recursive: bool,
-    extensions: Optional[Set[str]],
-    keep_hidden: bool,
-) -> Iterator[str]:
+    extensions: Optional[frozenset[str]],
+    include_hidden: bool,
+    follow_directory_symlinks: bool,
+) -> Iterator[Path]:
     stack = [root]
+    visited_dirs: set[tuple[int, int]] = set()
 
-    while stack and not stop_event.is_set():
+    while stack and not STOP_EVENT.is_set():
         current = stack.pop()
-
         try:
+            if follow_directory_symlinks:
+                current_stat = current.stat()
+                directory_id = (current_stat.st_dev, current_stat.st_ino)
+                if directory_id in visited_dirs:
+                    LOGGER.warning("%sSkipped directory cycle: %s", Fore.YELLOW, current)
+                    continue
+                visited_dirs.add(directory_id)
+
             with os.scandir(current) as entries:
                 for entry in entries:
-                    if stop_event.is_set():
-                        break
-
-                    name = entry.name
-                    if not keep_hidden and name.startswith("."):
+                    if STOP_EVENT.is_set():
+                        return
+                    if not include_hidden and entry.name.startswith("."):
                         continue
 
                     try:
+                        if entry.is_dir(follow_symlinks=follow_directory_symlinks):
+                            if recursive:
+                                stack.append(Path(entry.path))
+                            continue
                         mode = entry.stat(follow_symlinks=False).st_mode
-                    except OSError:
-                        continue
-
-                    if stat.S_ISDIR(mode):
-                        if recursive:
-                            stack.append(entry.path)
+                    except OSError as exc:
+                        LOGGER.warning("%sSkipped: %s | %s", Fore.YELLOW, entry.path, exc)
                         continue
 
                     if not stat.S_ISREG(mode):
                         continue
 
-                    if extensions:
-                        ext = os.path.splitext(name)[1].lower()
-                        if ext not in extensions:
+                    if extensions is not None:
+                        extension = Path(entry.name).suffix.casefold()
+                        if extension not in extensions:
                             continue
-
-                    yield entry.path
-        except PermissionError:
-            logger.warning("%sSkipped, no permission: %s", Fore.YELLOW, current)
-        except FileNotFoundError:
-            logger.warning("%sSkipped, disappeared: %s", Fore.YELLOW, current)
+                    yield Path(entry.path)
+        except (PermissionError, FileNotFoundError) as exc:
+            LOGGER.warning("%sSkipped directory: %s | %s", Fore.YELLOW, current, exc)
         except OSError as exc:
-            logger.warning("%sSkipped: %s | %s", Fore.YELLOW, current, exc)
+            LOGGER.warning("%sSkipped directory: %s | %s", Fore.YELLOW, current, exc)
 
 
-def worker(
-    q: queue.Queue[Optional[str]],
+def reserve_target(
+    source: Path,
+    desired_name: str,
+    *,
+    reserved: set[str],
+    cfg: SanitizerConfig,
+    max_attempts: int,
+) -> Path:
+    for index in range(max_attempts + 1):
+        name = desired_name if index == 0 else candidate_name(desired_name, index, cfg.max_length)
+        candidate = source.with_name(name)
+        key = collision_key(candidate, cfg.case_insensitive_collisions)
+        if _same_file(source, candidate):
+            return candidate
+        if key in reserved:
+            continue
+        if candidate.exists():
+            reserved.add(key)
+            continue
+        reserved.add(key)
+        return candidate
+    raise FileExistsError(f"No free destination name for {source}")
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def build_plan(
+    files: Iterable[Path],
     *,
     cfg: SanitizerConfig,
-    translation_table: dict[int, str],
-    dry_run: bool,
-    backup: bool,
-    counter: Counter,
-) -> None:
-    local_processed = 0
-    local_renamed = 0
-    local_failed = 0
+    max_attempts: int,
+    stats: Statistics,
+) -> list[RenamePlan]:
+    file_list = list(files)
+    stats.discovered = len(file_list)
 
-    while True:
-        try:
-            item = q.get(timeout=0.2)
-        except queue.Empty:
-            if stop_event.is_set():
-                continue
+    # Reserve all original paths first. This prevents a rename from taking the
+    # current name of another file that is scheduled to be renamed later.
+    reserved = {
+        collision_key(path, cfg.case_insensitive_collisions)
+        for path in file_list
+    }
+    plans: list[RenamePlan] = []
+
+    for source in file_list:
+        desired_name = sanitize_filename(source.name, cfg)
+        if desired_name == source.name:
+            stats.unchanged += 1
             continue
 
-        if item is None:
-            q.task_done()
-            break
+        # Keep every original path reserved throughout planning. This avoids
+        # order-dependent plans where one file targets another source's current
+        # name and then fails when renames execute concurrently.
+        target = reserve_target(
+            source,
+            desired_name,
+            reserved=reserved,
+            cfg=cfg,
+            max_attempts=max_attempts,
+        )
+        plans.append(RenamePlan(source=source, target=target))
 
+    stats.planned = len(plans)
+    return plans
+
+
+def atomic_copy_backup(source: Path, *, max_attempts: int) -> Path:
+    """Create a backup using exclusive creation, avoiding check-then-copy races."""
+    base = source.with_name(source.name + ".bak")
+    for index in range(max_attempts + 1):
+        candidate = base if index == 0 else source.with_name(f"{source.name}.bak_{index}")
         try:
-            result = rename_file(
-                item,
-                cfg=cfg,
-                translation_table=translation_table,
-                dry_run=dry_run,
-                backup=backup,
-            )
-            local_processed += 1
-            local_renamed += int(result.changed)
-        except Exception as exc:
-            local_processed += 1
-            local_failed += 1
-            logger.error("%sFailed: %s | %s", Fore.RED, item, exc)
-        finally:
-            q.task_done()
+            with source.open("rb") as src, candidate.open("xb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            try:
+                shutil.copystat(source, candidate, follow_symlinks=False)
+            except OSError:
+                LOGGER.debug("Could not copy all metadata to %s", candidate, exc_info=True)
+            return candidate
+        except FileExistsError:
+            continue
+        except Exception:
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+    raise FileExistsError(f"Could not create backup for {source}")
 
-        if local_processed >= 100:
-            counter.flush(local_processed, local_renamed, local_failed)
-            local_processed = local_renamed = local_failed = 0
 
-    counter.flush(local_processed, local_renamed, local_failed)
+def link_then_unlink(source: Path, target: Path) -> None:
+    os.link(source, target)
+    try:
+        source.unlink()
+    except Exception:
+        try:
+            target.unlink()
+        except OSError:
+            LOGGER.critical("Rollback failed; both names may exist: %s and %s", source, target)
+        raise
+
+
+def rename_no_overwrite(source: Path, target: Path) -> None:
+    """Rename a regular file without intentionally replacing an existing path."""
+    if os.name == "nt":
+        # On Windows os.rename does not overwrite an existing destination.
+        os.rename(source, target)
+        return
+
+    try:
+        # Atomic destination creation on POSIX for regular files.
+        link_then_unlink(source, target)
+    except OSError as exc:
+        if exc.errno in {errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}:
+            # Some filesystems do not support hard links. There is no portable
+            # atomic NOREPLACE rename in Python's stdlib, so fail safely instead
+            # of risking an overwrite with os.rename().
+            raise OSError(
+                exc.errno,
+                "filesystem does not support safe no-overwrite renaming",
+                os.fspath(source),
+            ) from exc
+        raise
+
+
+def execute_plan(
+    plan: RenamePlan,
+    *,
+    backup: bool,
+    max_attempts: int,
+) -> RenameResult:
+    if STOP_EVENT.is_set():
+        return RenameResult(plan.source, plan.target, renamed=False, error="cancelled")
+
+    backup_path: Optional[Path] = None
+    try:
+        if not plan.source.is_file():
+            raise FileNotFoundError(f"source disappeared or is no longer regular: {plan.source}")
+        if plan.target.exists() and not _same_file(plan.source, plan.target):
+            raise FileExistsError(f"destination appeared after planning: {plan.target}")
+        if backup:
+            backup_path = atomic_copy_backup(plan.source, max_attempts=max_attempts)
+        rename_no_overwrite(plan.source, plan.target)
+        return RenameResult(plan.source, plan.target, renamed=True, backup_path=backup_path)
+    except Exception as exc:
+        return RenameResult(
+            plan.source,
+            plan.target,
+            renamed=False,
+            backup_path=backup_path,
+            error=str(exc),
+        )
 
 
 def process_directory(
-    directory: str,
+    directory: Path,
     *,
     dry_run: bool,
     recursive: bool,
     file_types: Optional[Sequence[str]],
     cfg: SanitizerConfig,
-    max_workers: int,
+    workers: int,
     backup: bool,
-) -> None:
-    directory = os.path.abspath(directory)
-    if not os.path.isdir(directory):
-        raise ValueError(f"Invalid directory: {directory}")
+    include_hidden: bool,
+    follow_directory_symlinks: bool,
+    max_attempts: int,
+) -> Statistics:
+    root = directory.expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"Invalid directory: {root}")
 
     extensions = normalize_extensions(file_types)
-    translation_table = build_translation_table(cfg.replacement)
-    queue_size = max(5_000, max_workers * 1_000)
-    q: queue.Queue[Optional[str]] = queue.Queue(maxsize=queue_size)
-    counter = Counter()
+    stats = Statistics()
+    started = time.perf_counter()
 
-    workers = [
-        threading.Thread(
-            target=worker,
-            daemon=False,
-            kwargs={
-                "q": q,
-                "cfg": cfg,
-                "translation_table": translation_table,
-                "dry_run": dry_run,
-                "backup": backup,
-                "counter": counter,
-            },
+    files = iter_files(
+        root,
+        recursive=recursive,
+        extensions=extensions,
+        include_hidden=include_hidden,
+        follow_directory_symlinks=follow_directory_symlinks,
+    )
+    plans = build_plan(
+        files,
+        cfg=cfg,
+        max_attempts=max_attempts,
+        stats=stats,
+    )
+
+    if dry_run:
+        for plan in plans:
+            LOGGER.info("[Dry-run] %s → %s", plan.source, plan.target.name)
+        elapsed = time.perf_counter() - started
+        LOGGER.info(
+            "%sDry-run complete — Found: %s | Unchanged: %s | Would rename: %s | Time: %.2fs",
+            Fore.CYAN,
+            f"{stats.discovered:,}",
+            f"{stats.unchanged:,}",
+            f"{stats.planned:,}",
+            elapsed,
         )
-        for _ in range(max_workers)
-    ]
+        return stats
 
-    for thread in workers:
-        thread.start()
-
-    progress = tqdm(unit="file", desc="Scanning", dynamic_ncols=True) if tqdm else None
-    start = time.perf_counter()
+    progress = tqdm(total=len(plans), unit="file", desc="Renaming", dynamic_ncols=True) if tqdm else None
+    futures: list[Future[RenameResult]] = []
 
     try:
-        for filepath in collect_files(
-            directory,
-            recursive=recursive,
-            extensions=extensions,
-            keep_hidden=cfg.keep_hidden,
-        ):
-            if stop_event.is_set():
-                break
-            q.put(filepath)
-            if progress:
-                progress.update(1)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sanitize") as executor:
+            for plan in plans:
+                if STOP_EVENT.is_set():
+                    break
+                futures.append(
+                    executor.submit(
+                        execute_plan,
+                        plan,
+                        backup=backup,
+                        max_attempts=max_attempts,
+                    )
+                )
+
+            for future in as_completed(futures):
+                result = future.result()
+                if result.renamed:
+                    stats.renamed += 1
+                    LOGGER.info(
+                        "%sRenamed: %s → %s%s",
+                        Fore.GREEN,
+                        result.source.name,
+                        result.target.name,
+                        f" | backup: {result.backup_path.name}" if result.backup_path else "",
+                    )
+                else:
+                    stats.failed += 1
+                    LOGGER.error(
+                        "%sFailed: %s → %s | %s",
+                        Fore.RED,
+                        result.source,
+                        result.target.name,
+                        result.error or "unknown error",
+                    )
+                if progress:
+                    progress.update(1)
     finally:
-        for _ in workers:
-            q.put(None)
-        q.join()
-        for thread in workers:
-            thread.join()
         if progress:
             progress.close()
 
-    elapsed = time.perf_counter() - start
-    logger.info(
-        "%sDone — Processed: %s | Renamed: %s | Failed: %s | Time: %.2fs",
+    elapsed = time.perf_counter() - started
+    LOGGER.info(
+        "%sDone — Found: %s | Unchanged: %s | Planned: %s | Renamed: %s | Failed: %s | Time: %.2fs",
         Fore.CYAN,
-        f"{counter.processed:,}",
-        f"{counter.renamed:,}",
-        f"{counter.failed:,}",
+        f"{stats.discovered:,}",
+        f"{stats.unchanged:,}",
+        f"{stats.planned:,}",
+        f"{stats.renamed:,}",
+        f"{stats.failed:,}",
         elapsed,
     )
+    return stats
 
 
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Batch sanitize filenames safely")
-    parser.add_argument("directory", help="Directory to process")
-    parser.add_argument("--recursive", action="store_true", help="Process subdirectories")
-    parser.add_argument("--dry-run", action="store_true", help="Show changes without renaming")
-    parser.add_argument("--backup", action="store_true", help="Create .bak copy before rename")
-    parser.add_argument("--replacement", default="_", help="Replacement for illegal chars/spaces")
-    parser.add_argument("--threads", type=int, default=min(32, (os.cpu_count() or 4) * 2))
-    parser.add_argument("--file-types", type=lambda s: s.split(","), help="Comma-separated extensions: jpg,png,pdf")
-    parser.add_argument("--max-length", type=int, default=255, help="Maximum filename length")
-    parser.add_argument("--keep-hidden", action="store_true", help="Do not skip dotfiles")
-    parser.add_argument("--no-unicode-normalize", action="store_true", help="Disable Unicode NFKC normalization")
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Batch-sanitize filenames without overwriting existing files",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("directory", type=Path, help="directory to process")
+    parser.add_argument("-r", "--recursive", action="store_true", help="process subdirectories")
+    parser.add_argument("-n", "--dry-run", action="store_true", help="show the exact rename plan")
+    parser.add_argument("--backup", action="store_true", help="create a backup before each rename")
+    parser.add_argument("--replacement", type=validate_replacement, default="_", help="replacement for unsafe characters and whitespace")
+    parser.add_argument("--threads", type=positive_int, default=min(16, (os.cpu_count() or 4) * 2), help="parallel rename workers")
+    parser.add_argument("--file-types", action="append", help="extensions, comma-separated; may be repeated")
+    parser.add_argument("--max-length", type=positive_int, default=255, help="maximum filename length in characters")
+    parser.add_argument("--include-hidden", action="store_true", help="include dotfiles and hidden dot-directories")
+    parser.add_argument("--preserve-leading-dot", action="store_true", help="keep a leading dot when sanitizing dotfiles")
+    parser.add_argument("--follow-directory-symlinks", action="store_true", help="follow symlinked directories with cycle detection")
+    parser.add_argument("--case-sensitive-collisions", action="store_true", help="treat case-only names as distinct even on Windows")
+    parser.add_argument("--no-unicode-normalize", action="store_true", help="disable Unicode NFKC normalization")
+    parser.add_argument("--max-attempts", type=positive_int, default=10_000, help="maximum collision suffix attempts")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.max_length < 16:
+        parser.error("--max-length must be at least 16")
+    return args
 
 
 def handle_signal(signum: int, *_: object) -> None:
-    stop_event.set()
-    logger.warning("Stopping gracefully after signal %s...", signum)
+    if STOP_EVENT.is_set():
+        raise KeyboardInterrupt
+    STOP_EVENT.set()
+    LOGGER.warning("Stopping after signal %s; already-running renames will finish...", signum)
 
 
-def main() -> int:
-    args = parse_arguments()
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_arguments(argv)
     setup_logging(args.log_level)
+    STOP_EVENT.clear()
 
-    try:
-        replacement = validate_replacement(args.replacement)
-        if args.max_length < 16:
-            raise ValueError("--max-length must be at least 16")
-
-        cfg = SanitizerConfig(
-            replacement=replacement,
-            max_length=args.max_length,
-            keep_hidden=args.keep_hidden,
-            normalize_unicode=not args.no_unicode_normalize,
-        )
-
-        signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, handle_signal)
 
-        process_directory(
-            directory=args.directory,
+    cfg = SanitizerConfig(
+        replacement=args.replacement,
+        max_length=args.max_length,
+        normalize_unicode=not args.no_unicode_normalize,
+        preserve_leading_dot=args.preserve_leading_dot,
+        case_insensitive_collisions=(os.name == "nt" and not args.case_sensitive_collisions),
+    )
+
+    try:
+        stats = process_directory(
+            args.directory,
             dry_run=args.dry_run,
             recursive=args.recursive,
             file_types=args.file_types,
             cfg=cfg,
-            max_workers=max(1, args.threads),
+            workers=args.threads,
             backup=args.backup,
+            include_hidden=args.include_hidden,
+            follow_directory_symlinks=args.follow_directory_symlinks,
+            max_attempts=args.max_attempts,
         )
-        return 0
+        if STOP_EVENT.is_set():
+            return 130
+        return 2 if stats.failed else 0
+    except KeyboardInterrupt:
+        LOGGER.warning("Interrupted by user")
+        return 130
     except Exception as exc:
-        logger.exception("Fatal error: %s", exc)
+        LOGGER.exception("Fatal error: %s", exc)
         return 1
 
 
