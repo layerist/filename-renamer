@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-File Sanitizer v2 — safe and predictable batch filename sanitizer.
+File Sanitizer v3 — safe, deterministic batch filename sanitizer.
 
-Key properties:
-- never intentionally overwrites an existing file;
-- plans collision-free names before execution, so dry-run matches real output;
-- supports recursive scan, extension filters, backups and parallel execution;
-- preserves file extensions while enforcing a configurable filename limit;
-- handles Windows reserved names and trailing spaces/dots;
-- stops cleanly on Ctrl+C and returns a meaningful exit code.
+Main guarantees:
+- never intentionally overwrites an existing path;
+- dry-run uses the same precomputed rename/backup plan as real execution;
+- original filenames, rename targets, and backup paths are reserved together;
+- broken symlinks count as occupied destinations;
+- regular-file identity is captured during planning and checked again before rename;
+- filename limits are enforced by characters and, on POSIX, filesystem byte limits;
+- supports recursion, extension filters, backups, parallel execution, and Ctrl+C;
+- Windows reserved names / trailing spaces and dots are handled portably.
 
 Python: 3.9+
 Optional: tqdm, colorama
@@ -30,6 +32,7 @@ import time
 import unicodedata
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Sequence
 
@@ -48,16 +51,20 @@ except ImportError:  # pragma: no cover
 
     Fore = _Dummy()
 
+
 LOGGER = logging.getLogger("file_sanitizer")
 STOP_EVENT = threading.Event()
 
 ILLEGAL_CHARS = frozenset('<>:"/\\|?*')
+WHITESPACE_RE = re.compile(r"\s+")
+
+# Win32 device names are reserved even when followed by an extension.
 WINDOWS_RESERVED = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{i}" for i in range(1, 10)}
     | {f"LPT{i}" for i in range(1, 10)}
+    | {"COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"}
 )
-WHITESPACE_RE = re.compile(r"\s+")
 
 
 @dataclass(frozen=True)
@@ -70,9 +77,20 @@ class SanitizerConfig:
 
 
 @dataclass(frozen=True)
+class FileIdentity:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
 class RenamePlan:
     source: Path
     target: Path
+    source_identity: FileIdentity
+    backup_target: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +109,7 @@ class Statistics:
     planned: int = 0
     renamed: int = 0
     failed: int = 0
+    cancelled: int = 0
 
 
 def setup_logging(level: str) -> None:
@@ -129,39 +148,120 @@ def normalize_extensions(values: Optional[Sequence[str]]) -> Optional[frozenset[
 
 
 def split_filename(name: str) -> tuple[str, str]:
-    """Split a filename while treating dotfiles such as '.env' as extensionless."""
+    """Split a filename while treating '.env' as extensionless."""
     if name.startswith(".") and name.count(".") == 1:
         return name, ""
-    stem, suffix = os.path.splitext(name)
-    return stem, suffix
+    return os.path.splitext(name)
 
 
-def truncate_filename(stem: str, suffix: str, max_length: int, extra: str = "") -> str:
-    """Apply a character limit while retaining suffix and collision marker."""
-    suffix_budget = len(suffix) + len(extra)
-    if suffix_budget >= max_length:
-        # Extremely long extension: keep a minimal stem and the rightmost suffix part.
-        suffix = suffix[-max(0, max_length - len(extra) - 1):]
-        return f"x{extra}{suffix}"[:max_length]
-
-    allowed = max_length - suffix_budget
-    return f"{stem[:allowed]}{extra}{suffix}"
+def path_lexists(path: Path) -> bool:
+    """exists(), but broken symlinks are considered occupied."""
+    return os.path.lexists(os.fspath(path))
 
 
-def sanitize_filename(name: str, cfg: SanitizerConfig) -> str:
+@lru_cache(maxsize=1024)
+def directory_name_max_bytes(directory: str) -> Optional[int]:
+    """
+    Return the filesystem component-name byte limit on POSIX.
+
+    On Windows, Win32 naming rules are character-oriented enough for this
+    sanitizer's configurable max_length, so no byte limit is applied here.
+    """
+    if os.name == "nt":
+        return None
+    try:
+        value = os.pathconf(directory, "PC_NAME_MAX")
+        return int(value) if value > 0 else None
+    except (OSError, ValueError):
+        return 255
+
+
+def filesystem_encoded_length(value: str) -> int:
+    encoding = sys.getfilesystemencoding() or "utf-8"
+    return len(value.encode(encoding, errors="surrogateescape"))
+
+
+def _fits_component(name: str, directory: Path, max_chars: int) -> bool:
+    if len(name) > max_chars:
+        return False
+    byte_limit = directory_name_max_bytes(os.fspath(directory))
+    return byte_limit is None or filesystem_encoded_length(name) <= byte_limit
+
+
+def fit_filename(
+    stem: str,
+    suffix: str,
+    *,
+    directory: Path,
+    max_chars: int,
+    extra: str = "",
+    prefix: str = "",
+) -> str:
+    """
+    Fit a filename component while preferentially preserving:
+    prefix + stem + collision marker + suffix.
+
+    On POSIX this also respects the filesystem's byte-based NAME_MAX limit,
+    which matters for multibyte Unicode filenames.
+    """
+    stem = stem or "x"
+
+    def compose(s: str, x: str) -> str:
+        return f"{prefix}{s}{extra}{x}"
+
+    # Fast path.
+    result = compose(stem, suffix)
+    if _fits_component(result, directory, max_chars):
+        return result
+
+    # First shrink the stem, preserving at least one character.
+    lo, hi = 1, len(stem)
+    best_stem = stem[:1]
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate_stem = stem[:mid]
+        candidate = compose(candidate_stem, suffix)
+        if _fits_component(candidate, directory, max_chars):
+            best_stem = candidate_stem
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    result = compose(best_stem, suffix)
+    if _fits_component(result, directory, max_chars):
+        return result
+
+    # Extremely long suffix/marker: preserve the rightmost suffix characters.
+    trimmed_suffix = suffix
+    while trimmed_suffix:
+        trimmed_suffix = trimmed_suffix[1:]
+        result = compose("x", trimmed_suffix)
+        if _fits_component(result, directory, max_chars):
+            return result
+
+    # A pathological replacement/extra may itself be huge. Trim stem-independent
+    # material only as a final safety valve.
+    result = f"{prefix}x{extra}"
+    while result and not _fits_component(result, directory, max_chars):
+        result = result[:-1]
+    return result or "x"
+
+
+def sanitize_filename(name: str, cfg: SanitizerConfig, directory: Path) -> str:
     leading_dot = cfg.preserve_leading_dot and name.startswith(".")
     working = name[1:] if leading_dot else name
 
     if cfg.normalize_unicode:
         working = unicodedata.normalize("NFKC", working)
 
-    translated = []
+    translated: list[str] = []
     for char in working:
         codepoint = ord(char)
         if char in ILLEGAL_CHARS or codepoint < 32 or codepoint == 127:
             translated.append(cfg.replacement)
         else:
             translated.append(char)
+
     working = "".join(translated)
     working = WHITESPACE_RE.sub(cfg.replacement, working)
 
@@ -172,8 +272,7 @@ def sanitize_filename(name: str, cfg: SanitizerConfig) -> str:
             working,
         ).strip(cfg.replacement)
 
-    # Windows forbids trailing spaces and dots; applying this everywhere makes
-    # output portable and avoids surprising names.
+    # Portable Windows-compatible output.
     working = working.rstrip(" .")
     if not working:
         working = "unnamed"
@@ -182,11 +281,16 @@ def sanitize_filename(name: str, cfg: SanitizerConfig) -> str:
     if stem.upper() in WINDOWS_RESERVED:
         stem = f"_{stem}"
 
-    result = truncate_filename(stem, suffix, cfg.max_length)
-    if leading_dot:
-        # The leading dot counts towards the limit.
-        result = "." + result[: max(1, cfg.max_length - 1)]
+    result = fit_filename(
+        stem,
+        suffix,
+        directory=directory,
+        max_chars=cfg.max_length,
+        prefix="." if leading_dot else "",
+    )
 
+    # A final portable cleanup in case truncation exposed an odd edge case.
+    result = result.rstrip(" .")
     if result in {"", ".", ".."}:
         result = "unnamed"
     return result
@@ -197,9 +301,105 @@ def collision_key(path: Path, case_insensitive: bool) -> str:
     return value.casefold() if case_insensitive else value
 
 
-def candidate_name(base_name: str, index: int, max_length: int) -> str:
+def capture_identity(path: Path) -> FileIdentity:
+    st = path.stat(follow_symlinks=False)
+    return FileIdentity(
+        device=st.st_dev,
+        inode=st.st_ino,
+        mode=st.st_mode,
+        size=st.st_size,
+        mtime_ns=st.st_mtime_ns,
+    )
+
+
+def same_identity(path: Path, expected: FileIdentity) -> bool:
+    try:
+        actual = capture_identity(path)
+    except OSError:
+        return False
+    return (
+        actual.device == expected.device
+        and actual.inode == expected.inode
+        and stat.S_IFMT(actual.mode) == stat.S_IFMT(expected.mode)
+        and actual.size == expected.size
+        and actual.mtime_ns == expected.mtime_ns
+    )
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def candidate_name(
+    base_name: str,
+    index: int,
+    *,
+    directory: Path,
+    max_length: int,
+) -> str:
     stem, suffix = split_filename(base_name)
-    return truncate_filename(stem, suffix, max_length, extra=f"_{index}")
+    return fit_filename(
+        stem,
+        suffix,
+        directory=directory,
+        max_chars=max_length,
+        extra=f"_{index}",
+    )
+
+
+def reserve_unique_path(
+    source: Path,
+    desired_name: str,
+    *,
+    reserved: set[str],
+    cfg: SanitizerConfig,
+    max_attempts: int,
+    allow_same_source: bool,
+) -> Path:
+    directory = source.parent
+
+    for index in range(max_attempts + 1):
+        name = (
+            desired_name
+            if index == 0
+            else candidate_name(
+                desired_name,
+                index,
+                directory=directory,
+                max_length=cfg.max_length,
+            )
+        )
+        candidate = source.with_name(name)
+        key = collision_key(candidate, cfg.case_insensitive_collisions)
+
+        if allow_same_source and _same_file(source, candidate):
+            return candidate
+        if key in reserved:
+            continue
+        if path_lexists(candidate):
+            reserved.add(key)
+            continue
+
+        reserved.add(key)
+        return candidate
+
+    raise FileExistsError(f"No free destination name for {source}")
+
+
+def make_backup_basename(source: Path, cfg: SanitizerConfig) -> str:
+    stem, suffix = split_filename(source.name)
+    # Keep the original extension at the end: "report.bak.txt" is easier to
+    # recognize and lets extension-based tools still identify the file.
+    return fit_filename(
+        stem,
+        suffix,
+        directory=source.parent,
+        max_chars=cfg.max_length,
+        extra=".bak",
+    )
 
 
 def iter_files(
@@ -215,12 +415,17 @@ def iter_files(
 
     while stack and not STOP_EVENT.is_set():
         current = stack.pop()
+
         try:
             if follow_directory_symlinks:
                 current_stat = current.stat()
                 directory_id = (current_stat.st_dev, current_stat.st_ino)
                 if directory_id in visited_dirs:
-                    LOGGER.warning("%sSkipped directory cycle: %s", Fore.YELLOW, current)
+                    LOGGER.warning(
+                        "%sSkipped directory cycle: %s",
+                        Fore.YELLOW,
+                        current,
+                    )
                     continue
                 visited_dirs.add(directory_id)
 
@@ -228,6 +433,7 @@ def iter_files(
                 for entry in entries:
                     if STOP_EVENT.is_set():
                         return
+
                     if not include_hidden and entry.name.startswith("."):
                         continue
 
@@ -236,54 +442,42 @@ def iter_files(
                             if recursive:
                                 stack.append(Path(entry.path))
                             continue
-                        mode = entry.stat(follow_symlinks=False).st_mode
+
+                        st = entry.stat(follow_symlinks=False)
                     except OSError as exc:
-                        LOGGER.warning("%sSkipped: %s | %s", Fore.YELLOW, entry.path, exc)
+                        LOGGER.warning(
+                            "%sSkipped: %s | %s",
+                            Fore.YELLOW,
+                            entry.path,
+                            exc,
+                        )
                         continue
 
-                    if not stat.S_ISREG(mode):
+                    # Explicitly skip symlinks and every non-regular object.
+                    if not stat.S_ISREG(st.st_mode):
                         continue
 
                     if extensions is not None:
                         extension = Path(entry.name).suffix.casefold()
                         if extension not in extensions:
                             continue
+
                     yield Path(entry.path)
+
         except (PermissionError, FileNotFoundError) as exc:
-            LOGGER.warning("%sSkipped directory: %s | %s", Fore.YELLOW, current, exc)
+            LOGGER.warning(
+                "%sSkipped directory: %s | %s",
+                Fore.YELLOW,
+                current,
+                exc,
+            )
         except OSError as exc:
-            LOGGER.warning("%sSkipped directory: %s | %s", Fore.YELLOW, current, exc)
-
-
-def reserve_target(
-    source: Path,
-    desired_name: str,
-    *,
-    reserved: set[str],
-    cfg: SanitizerConfig,
-    max_attempts: int,
-) -> Path:
-    for index in range(max_attempts + 1):
-        name = desired_name if index == 0 else candidate_name(desired_name, index, cfg.max_length)
-        candidate = source.with_name(name)
-        key = collision_key(candidate, cfg.case_insensitive_collisions)
-        if _same_file(source, candidate):
-            return candidate
-        if key in reserved:
-            continue
-        if candidate.exists():
-            reserved.add(key)
-            continue
-        reserved.add(key)
-        return candidate
-    raise FileExistsError(f"No free destination name for {source}")
-
-
-def _same_file(first: Path, second: Path) -> bool:
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+            LOGGER.warning(
+                "%sSkipped directory: %s | %s",
+                Fore.YELLOW,
+                current,
+                exc,
+            )
 
 
 def build_plan(
@@ -291,66 +485,118 @@ def build_plan(
     *,
     cfg: SanitizerConfig,
     max_attempts: int,
+    backup: bool,
     stats: Statistics,
 ) -> list[RenamePlan]:
     file_list = list(files)
     stats.discovered = len(file_list)
 
-    # Reserve all original paths first. This prevents a rename from taking the
-    # current name of another file that is scheduled to be renamed later.
+    # Reserve every original source path, even unchanged files. This prevents
+    # one rename from taking another file's current name.
     reserved = {
         collision_key(path, cfg.case_insensitive_collisions)
         for path in file_list
     }
+
     plans: list[RenamePlan] = []
 
     for source in file_list:
-        desired_name = sanitize_filename(source.name, cfg)
+        try:
+            identity = capture_identity(source)
+        except OSError as exc:
+            stats.failed += 1
+            LOGGER.error("%sCould not stat %s | %s", Fore.RED, source, exc)
+            continue
+
+        if not stat.S_ISREG(identity.mode):
+            stats.failed += 1
+            LOGGER.error("%sSource is no longer a regular file: %s", Fore.RED, source)
+            continue
+
+        desired_name = sanitize_filename(source.name, cfg, source.parent)
         if desired_name == source.name:
             stats.unchanged += 1
             continue
 
-        # Keep every original path reserved throughout planning. This avoids
-        # order-dependent plans where one file targets another source's current
-        # name and then fails when renames execute concurrently.
-        target = reserve_target(
+        target = reserve_unique_path(
             source,
             desired_name,
             reserved=reserved,
             cfg=cfg,
             max_attempts=max_attempts,
+            allow_same_source=True,
         )
-        plans.append(RenamePlan(source=source, target=target))
+
+        backup_target: Optional[Path] = None
+        if backup:
+            backup_name = make_backup_basename(source, cfg)
+            backup_target = reserve_unique_path(
+                source,
+                backup_name,
+                reserved=reserved,
+                cfg=cfg,
+                max_attempts=max_attempts,
+                allow_same_source=False,
+            )
+
+        plans.append(
+            RenamePlan(
+                source=source,
+                target=target,
+                source_identity=identity,
+                backup_target=backup_target,
+            )
+        )
 
     stats.planned = len(plans)
     return plans
 
 
-def atomic_copy_backup(source: Path, *, max_attempts: int) -> Path:
-    """Create a backup using exclusive creation, avoiding check-then-copy races."""
-    base = source.with_name(source.name + ".bak")
-    for index in range(max_attempts + 1):
-        candidate = base if index == 0 else source.with_name(f"{source.name}.bak_{index}")
+def copy_backup_exclusive(
+    source: Path,
+    target: Path,
+    *,
+    fsync_backup: bool,
+) -> Path:
+    """
+    Copy a backup to an already-planned unique path using exclusive creation.
+
+    Exclusive 'xb' protects against an external process creating the same path
+    after planning.
+    """
+    try:
+        with source.open("rb") as src, target.open("xb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            if fsync_backup:
+                os.fsync(dst.fileno())
+
         try:
-            with source.open("rb") as src, candidate.open("xb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-            try:
-                shutil.copystat(source, candidate, follow_symlinks=False)
-            except OSError:
-                LOGGER.debug("Could not copy all metadata to %s", candidate, exc_info=True)
-            return candidate
-        except FileExistsError:
-            continue
-        except Exception:
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-    raise FileExistsError(f"Could not create backup for {source}")
+            shutil.copystat(source, target, follow_symlinks=False)
+        except OSError:
+            LOGGER.debug(
+                "Could not copy all metadata to %s",
+                target,
+                exc_info=True,
+            )
+
+        return target
+
+    except Exception:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("Could not remove incomplete backup: %s", target)
+        raise
 
 
 def link_then_unlink(source: Path, target: Path) -> None:
+    """
+    POSIX no-overwrite move for regular files using hard-link + unlink.
+
+    os.link() atomically fails if target already exists. If unlinking source
+    fails, target is removed as rollback where possible.
+    """
     os.link(source, target)
     try:
         source.unlink()
@@ -358,25 +604,29 @@ def link_then_unlink(source: Path, target: Path) -> None:
         try:
             target.unlink()
         except OSError:
-            LOGGER.critical("Rollback failed; both names may exist: %s and %s", source, target)
+            LOGGER.critical(
+                "Rollback failed; both names may exist: %s and %s",
+                source,
+                target,
+            )
         raise
 
 
 def rename_no_overwrite(source: Path, target: Path) -> None:
     """Rename a regular file without intentionally replacing an existing path."""
     if os.name == "nt":
-        # On Windows os.rename does not overwrite an existing destination.
+        # Win32 os.rename() fails if the destination exists.
         os.rename(source, target)
         return
 
     try:
-        # Atomic destination creation on POSIX for regular files.
         link_then_unlink(source, target)
     except OSError as exc:
-        if exc.errno in {errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP}:
-            # Some filesystems do not support hard links. There is no portable
-            # atomic NOREPLACE rename in Python's stdlib, so fail safely instead
-            # of risking an overwrite with os.rename().
+        if exc.errno in {
+            errno.EPERM,
+            errno.EOPNOTSUPP,
+            getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+        }:
             raise OSError(
                 exc.errno,
                 "filesystem does not support safe no-overwrite renaming",
@@ -388,22 +638,56 @@ def rename_no_overwrite(source: Path, target: Path) -> None:
 def execute_plan(
     plan: RenamePlan,
     *,
-    backup: bool,
-    max_attempts: int,
+    fsync_backup: bool,
 ) -> RenameResult:
     if STOP_EVENT.is_set():
-        return RenameResult(plan.source, plan.target, renamed=False, error="cancelled")
+        return RenameResult(
+            plan.source,
+            plan.target,
+            renamed=False,
+            error="cancelled",
+        )
 
     backup_path: Optional[Path] = None
+
     try:
-        if not plan.source.is_file():
-            raise FileNotFoundError(f"source disappeared or is no longer regular: {plan.source}")
-        if plan.target.exists() and not _same_file(plan.source, plan.target):
-            raise FileExistsError(f"destination appeared after planning: {plan.target}")
-        if backup:
-            backup_path = atomic_copy_backup(plan.source, max_attempts=max_attempts)
+        if not same_identity(plan.source, plan.source_identity):
+            raise RuntimeError(
+                f"source changed, disappeared, or was replaced after planning: {plan.source}"
+            )
+
+        if path_lexists(plan.target) and not _same_file(plan.source, plan.target):
+            raise FileExistsError(
+                f"destination appeared after planning: {plan.target}"
+            )
+
+        if plan.backup_target is not None:
+            if path_lexists(plan.backup_target):
+                raise FileExistsError(
+                    f"backup destination appeared after planning: {plan.backup_target}"
+                )
+            backup_path = copy_backup_exclusive(
+                plan.source,
+                plan.backup_target,
+                fsync_backup=fsync_backup,
+            )
+
+            # Re-check after copying: a long backup operation gives external
+            # processes time to replace the source path.
+            if not same_identity(plan.source, plan.source_identity):
+                raise RuntimeError(
+                    f"source changed while backup was being created: {plan.source}"
+                )
+
         rename_no_overwrite(plan.source, plan.target)
-        return RenameResult(plan.source, plan.target, renamed=True, backup_path=backup_path)
+
+        return RenameResult(
+            plan.source,
+            plan.target,
+            renamed=True,
+            backup_path=backup_path,
+        )
+
     except Exception as exc:
         return RenameResult(
             plan.source,
@@ -423,6 +707,7 @@ def process_directory(
     cfg: SanitizerConfig,
     workers: int,
     backup: bool,
+    fsync_backup: bool,
     include_hidden: bool,
     follow_directory_symlinks: bool,
     max_attempts: int,
@@ -442,46 +727,90 @@ def process_directory(
         include_hidden=include_hidden,
         follow_directory_symlinks=follow_directory_symlinks,
     )
+
     plans = build_plan(
         files,
         cfg=cfg,
         max_attempts=max_attempts,
+        backup=backup,
         stats=stats,
     )
 
     if dry_run:
         for plan in plans:
-            LOGGER.info("[Dry-run] %s → %s", plan.source, plan.target.name)
+            backup_info = (
+                f" | backup: {plan.backup_target.name}"
+                if plan.backup_target is not None
+                else ""
+            )
+            LOGGER.info(
+                "[Dry-run] %s → %s%s",
+                plan.source,
+                plan.target.name,
+                backup_info,
+            )
+
         elapsed = time.perf_counter() - started
         LOGGER.info(
-            "%sDry-run complete — Found: %s | Unchanged: %s | Would rename: %s | Time: %.2fs",
+            "%sDry-run complete — Found: %s | Unchanged: %s | "
+            "Would rename: %s | Pre-plan failures: %s | Time: %.2fs",
             Fore.CYAN,
             f"{stats.discovered:,}",
             f"{stats.unchanged:,}",
             f"{stats.planned:,}",
+            f"{stats.failed:,}",
             elapsed,
         )
         return stats
 
-    progress = tqdm(total=len(plans), unit="file", desc="Renaming", dynamic_ncols=True) if tqdm else None
-    futures: list[Future[RenameResult]] = []
+    progress = (
+        tqdm(
+            total=len(plans),
+            unit="file",
+            desc="Renaming",
+            dynamic_ncols=True,
+        )
+        if tqdm
+        else None
+    )
+
+    futures: dict[Future[RenameResult], RenamePlan] = {}
 
     try:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sanitize") as executor:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="sanitize",
+        ) as executor:
             for plan in plans:
                 if STOP_EVENT.is_set():
-                    break
-                futures.append(
-                    executor.submit(
-                        execute_plan,
-                        plan,
-                        backup=backup,
-                        max_attempts=max_attempts,
-                    )
+                    stats.cancelled += 1
+                    continue
+
+                future = executor.submit(
+                    execute_plan,
+                    plan,
+                    fsync_backup=fsync_backup,
                 )
+                futures[future] = plan
 
             for future in as_completed(futures):
-                result = future.result()
+                plan = futures[future]
+
+                try:
+                    result = future.result()
+                except BaseException as exc:
+                    stats.failed += 1
+                    LOGGER.exception(
+                        "%sWorker crashed: %s → %s | %s",
+                        Fore.RED,
+                        plan.source,
+                        plan.target.name,
+                        exc,
+                    )
+                    if progress:
+                        progress.update(1)
+                    continue
+
                 if result.renamed:
                     stats.renamed += 1
                     LOGGER.info(
@@ -489,7 +818,18 @@ def process_directory(
                         Fore.GREEN,
                         result.source.name,
                         result.target.name,
-                        f" | backup: {result.backup_path.name}" if result.backup_path else "",
+                        (
+                            f" | backup: {result.backup_path.name}"
+                            if result.backup_path
+                            else ""
+                        ),
+                    )
+                elif result.error == "cancelled":
+                    stats.cancelled += 1
+                    LOGGER.warning(
+                        "%sCancelled: %s",
+                        Fore.YELLOW,
+                        result.source,
                     )
                 else:
                     stats.failed += 1
@@ -500,28 +840,35 @@ def process_directory(
                         result.target.name,
                         result.error or "unknown error",
                     )
+
                 if progress:
                     progress.update(1)
+
     finally:
         if progress:
             progress.close()
 
     elapsed = time.perf_counter() - started
     LOGGER.info(
-        "%sDone — Found: %s | Unchanged: %s | Planned: %s | Renamed: %s | Failed: %s | Time: %.2fs",
+        "%sDone — Found: %s | Unchanged: %s | Planned: %s | "
+        "Renamed: %s | Failed: %s | Cancelled: %s | Time: %.2fs",
         Fore.CYAN,
         f"{stats.discovered:,}",
         f"{stats.unchanged:,}",
         f"{stats.planned:,}",
         f"{stats.renamed:,}",
         f"{stats.failed:,}",
+        f"{stats.cancelled:,}",
         elapsed,
     )
     return stats
 
 
 def positive_int(value: str) -> int:
-    number = int(value)
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
     if number < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return number
@@ -529,35 +876,120 @@ def positive_int(value: str) -> int:
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Batch-sanitize filenames without overwriting existing files",
+        description="Batch-sanitize filenames without overwriting existing paths",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("directory", type=Path, help="directory to process")
-    parser.add_argument("-r", "--recursive", action="store_true", help="process subdirectories")
-    parser.add_argument("-n", "--dry-run", action="store_true", help="show the exact rename plan")
-    parser.add_argument("--backup", action="store_true", help="create a backup before each rename")
-    parser.add_argument("--replacement", type=validate_replacement, default="_", help="replacement for unsafe characters and whitespace")
-    parser.add_argument("--threads", type=positive_int, default=min(16, (os.cpu_count() or 4) * 2), help="parallel rename workers")
-    parser.add_argument("--file-types", action="append", help="extensions, comma-separated; may be repeated")
-    parser.add_argument("--max-length", type=positive_int, default=255, help="maximum filename length in characters")
-    parser.add_argument("--include-hidden", action="store_true", help="include dotfiles and hidden dot-directories")
-    parser.add_argument("--preserve-leading-dot", action="store_true", help="keep a leading dot when sanitizing dotfiles")
-    parser.add_argument("--follow-directory-symlinks", action="store_true", help="follow symlinked directories with cycle detection")
-    parser.add_argument("--case-sensitive-collisions", action="store_true", help="treat case-only names as distinct even on Windows")
-    parser.add_argument("--no-unicode-normalize", action="store_true", help="disable Unicode NFKC normalization")
-    parser.add_argument("--max-attempts", type=positive_int, default=10_000, help="maximum collision suffix attempts")
-    parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+
+    parser.add_argument(
+        "directory",
+        type=Path,
+        help="directory to process",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="process subdirectories",
+    )
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="show the exact precomputed rename/backup plan",
+    )
+    parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="create a backup before each rename",
+    )
+    parser.add_argument(
+        "--fsync-backup",
+        action="store_true",
+        help="fsync backup contents before rename (slower, stronger durability)",
+    )
+    parser.add_argument(
+        "--replacement",
+        type=validate_replacement,
+        default="_",
+        help="replacement for unsafe characters and whitespace",
+    )
+    parser.add_argument(
+        "--threads",
+        type=positive_int,
+        default=min(16, (os.cpu_count() or 4) * 2),
+        help="parallel rename workers",
+    )
+    parser.add_argument(
+        "--file-types",
+        action="append",
+        help="extensions, comma-separated; may be repeated",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=positive_int,
+        default=255,
+        help="maximum filename length in characters",
+    )
+    parser.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="include dotfiles and hidden dot-directories",
+    )
+    parser.add_argument(
+        "--preserve-leading-dot",
+        action="store_true",
+        help="keep a leading dot when sanitizing dotfiles",
+    )
+    parser.add_argument(
+        "--follow-directory-symlinks",
+        action="store_true",
+        help="follow symlinked directories with cycle detection",
+    )
+    parser.add_argument(
+        "--case-sensitive-collisions",
+        action="store_true",
+        help=(
+            "treat case-only paths as distinct during planning; "
+            "unsafe on normal Windows directories"
+        ),
+    )
+    parser.add_argument(
+        "--no-unicode-normalize",
+        action="store_true",
+        help="disable Unicode NFKC normalization",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=positive_int,
+        default=10_000,
+        help="maximum collision suffix attempts",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+    )
+
     args = parser.parse_args(argv)
+
     if args.max_length < 16:
         parser.error("--max-length must be at least 16")
+
+    if args.fsync_backup and not args.backup:
+        parser.error("--fsync-backup requires --backup")
+
     return args
 
 
 def handle_signal(signum: int, *_: object) -> None:
     if STOP_EVENT.is_set():
         raise KeyboardInterrupt
+
     STOP_EVENT.set()
-    LOGGER.warning("Stopping after signal %s; already-running renames will finish...", signum)
+    LOGGER.warning(
+        "Stopping after signal %s; already-running filesystem operations will finish...",
+        signum,
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -574,7 +1006,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_length=args.max_length,
         normalize_unicode=not args.no_unicode_normalize,
         preserve_leading_dot=args.preserve_leading_dot,
-        case_insensitive_collisions=(os.name == "nt" and not args.case_sensitive_collisions),
+        case_insensitive_collisions=(
+            os.name == "nt" and not args.case_sensitive_collisions
+        ),
     )
 
     try:
@@ -586,13 +1020,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cfg=cfg,
             workers=args.threads,
             backup=args.backup,
+            fsync_backup=args.fsync_backup,
             include_hidden=args.include_hidden,
             follow_directory_symlinks=args.follow_directory_symlinks,
             max_attempts=args.max_attempts,
         )
-        if STOP_EVENT.is_set():
+
+        if STOP_EVENT.is_set() or stats.cancelled:
             return 130
         return 2 if stats.failed else 0
+
     except KeyboardInterrupt:
         LOGGER.warning("Interrupted by user")
         return 130
