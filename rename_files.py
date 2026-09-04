@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-File Sanitizer v3 — safe, deterministic batch filename sanitizer.
+File Sanitizer v4 — safer deterministic batch filename sanitizer.
 
 Main guarantees:
 - never intentionally overwrites an existing path;
@@ -10,7 +10,10 @@ Main guarantees:
 - regular-file identity is captured during planning and checked again before rename;
 - filename limits are enforced by characters and, on POSIX, filesystem byte limits;
 - supports recursion, extension filters, backups, parallel execution, and Ctrl+C;
-- Windows reserved names / trailing spaces and dots are handled portably.
+- Windows reserved names / trailing spaces and dots are handled portably;
+- planning order is deterministic even if os.scandir() order is not;
+- Linux uses atomic renameat2(RENAME_NOREPLACE) when available;
+- optional directory fsync can make completed renames more crash-durable.
 
 Python: 3.9+
 Optional: tqdm, colorama
@@ -19,6 +22,7 @@ Optional: tqdm, colorama
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import logging
 import os
@@ -73,7 +77,7 @@ class SanitizerConfig:
     max_length: int = 255
     normalize_unicode: bool = True
     preserve_leading_dot: bool = False
-    case_insensitive_collisions: bool = os.name == "nt"
+    case_insensitive_collisions: bool = (os.name == "nt" or sys.platform == "darwin")
 
 
 @dataclass(frozen=True)
@@ -121,17 +125,24 @@ def setup_logging(level: str) -> None:
 
 
 def validate_replacement(value: str) -> str:
-    if any(ch in ILLEGAL_CHARS for ch in value):
+    # Normalize the replacement itself. Otherwise a compatibility character
+    # such as FULLWIDTH SOLIDUS could pass validation and later normalize into
+    # an illegal character when names are processed elsewhere.
+    normalized = unicodedata.normalize("NFKC", value)
+
+    if len(normalized) > 32:
+        raise argparse.ArgumentTypeError("replacement must be at most 32 characters")
+    if any(ch in ILLEGAL_CHARS for ch in normalized):
         raise argparse.ArgumentTypeError(
             "replacement contains an illegal filename character"
         )
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized):
         raise argparse.ArgumentTypeError(
             "replacement must not contain control characters"
         )
-    if value in {".", ".."}:
+    if normalized in {".", ".."}:
         raise argparse.ArgumentTypeError("replacement cannot be '.' or '..'")
-    return value
+    return normalized
 
 
 def normalize_extensions(values: Optional[Sequence[str]]) -> Optional[frozenset[str]]:
@@ -152,6 +163,12 @@ def split_filename(name: str) -> tuple[str, str]:
     if name.startswith(".") and name.count(".") == 1:
         return name, ""
     return os.path.splitext(name)
+
+
+def is_windows_reserved_stem(stem: str) -> bool:
+    """Return True for Win32 device names, including trailing-dot/space forms."""
+    normalized = unicodedata.normalize("NFKC", stem).rstrip(" .").upper()
+    return normalized in WINDOWS_RESERVED
 
 
 def path_lexists(path: Path) -> bool:
@@ -278,8 +295,9 @@ def sanitize_filename(name: str, cfg: SanitizerConfig, directory: Path) -> str:
         working = "unnamed"
 
     stem, suffix = split_filename(working)
-    if stem.upper() in WINDOWS_RESERVED:
-        stem = f"_{stem}"
+    if is_windows_reserved_stem(stem):
+        # Prefix the cleaned stem rather than the raw device spelling.
+        stem = f"_{stem.rstrip(' .')}"
 
     result = fit_filename(
         stem,
@@ -390,9 +408,12 @@ def reserve_unique_path(
 
 
 def make_backup_basename(source: Path, cfg: SanitizerConfig) -> str:
-    stem, suffix = split_filename(source.name)
-    # Keep the original extension at the end: "report.bak.txt" is easier to
-    # recognize and lets extension-based tools still identify the file.
+    # Backups are newly-created names too, so sanitize them instead of carrying
+    # unsafe POSIX-only characters (for example ':') into backup filenames.
+    safe_name = sanitize_filename(source.name, cfg, source.parent)
+    stem, suffix = split_filename(safe_name)
+    # Keep the extension at the end: "report.bak.txt" remains recognizable by
+    # extension-based tools.
     return fit_filename(
         stem,
         suffix,
@@ -489,6 +510,15 @@ def build_plan(
     stats: Statistics,
 ) -> list[RenamePlan]:
     file_list = list(files)
+    # os.scandir() order is filesystem-dependent. Collision suffix assignment
+    # must not depend on that order if dry-run and repeated executions are to be
+    # deterministic.
+    file_list.sort(
+        key=lambda p: (
+            collision_key(p, cfg.case_insensitive_collisions),
+            os.fspath(p),
+        )
+    )
     stats.discovered = len(file_list)
 
     # Reserve every original source path, even unchanged files. This prevents
@@ -567,18 +597,22 @@ def copy_backup_exclusive(
     try:
         with source.open("rb") as src, target.open("xb") as dst:
             shutil.copyfileobj(src, dst, length=1024 * 1024)
+
+            # Apply metadata before the optional fsync so durability includes
+            # the metadata changes made by copystat as far as the platform
+            # permits.
+            try:
+                shutil.copystat(source, target, follow_symlinks=False)
+            except OSError:
+                LOGGER.debug(
+                    "Could not copy all metadata to %s",
+                    target,
+                    exc_info=True,
+                )
+
             dst.flush()
             if fsync_backup:
                 os.fsync(dst.fileno())
-
-        try:
-            shutil.copystat(source, target, follow_symlinks=False)
-        except OSError:
-            LOGGER.debug(
-                "Could not copy all metadata to %s",
-                target,
-                exc_info=True,
-            )
 
         return target
 
@@ -592,12 +626,13 @@ def copy_backup_exclusive(
 
 def link_then_unlink(source: Path, target: Path) -> None:
     """
-    POSIX no-overwrite move for regular files using hard-link + unlink.
+    Portable POSIX no-overwrite fallback for regular files.
 
-    os.link() atomically fails if target already exists. If unlinking source
-    fails, target is removed as rollback where possible.
+    os.link() atomically fails if target already exists. This is not a true
+    atomic rename because both names briefly coexist, so Linux first attempts
+    renameat2(RENAME_NOREPLACE).
     """
-    os.link(source, target)
+    os.link(source, target, follow_symlinks=False)
     try:
         source.unlink()
     except Exception:
@@ -612,33 +647,105 @@ def link_then_unlink(source: Path, target: Path) -> None:
         raise
 
 
+_RENAMEAT2_UNAVAILABLE_ERRNOS = {
+    errno.ENOSYS,
+    errno.EINVAL,
+    errno.EOPNOTSUPP,
+    getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+}
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+
+
+def linux_rename_noreplace(source: Path, target: Path) -> bool:
+    """
+    Attempt Linux renameat2(..., RENAME_NOREPLACE).
+
+    Return True on success and False only when the API/filesystem does not
+    support the operation. Other errors are propagated.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError):
+        return False
+
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(target),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return True
+
+    error = ctypes.get_errno()
+    if error in _RENAMEAT2_UNAVAILABLE_ERRNOS:
+        return False
+    raise OSError(error, os.strerror(error), os.fspath(source), os.fspath(target))
+
+
 def rename_no_overwrite(source: Path, target: Path) -> None:
     """Rename a regular file without intentionally replacing an existing path."""
     if os.name == "nt":
-        # Win32 os.rename() fails if the destination exists.
+        # Win32 os.rename() fails when the destination already exists.
         os.rename(source, target)
+        return
+
+    if linux_rename_noreplace(source, target):
         return
 
     try:
         link_then_unlink(source, target)
     except OSError as exc:
         if exc.errno in {
+            errno.EXDEV,
             errno.EPERM,
             errno.EOPNOTSUPP,
             getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
         }:
             raise OSError(
                 exc.errno,
-                "filesystem does not support safe no-overwrite renaming",
+                "filesystem does not support a safe no-overwrite rename fallback",
                 os.fspath(source),
             ) from exc
         raise
+
+
+def fsync_directory(directory: Path) -> None:
+    """Best-effort directory fsync for rename/link durability on POSIX."""
+    if os.name == "nt":
+        return
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def execute_plan(
     plan: RenamePlan,
     *,
     fsync_backup: bool,
+    fsync_dir: bool,
 ) -> RenameResult:
     if STOP_EVENT.is_set():
         return RenameResult(
@@ -681,6 +788,17 @@ def execute_plan(
 
         rename_no_overwrite(plan.source, plan.target)
 
+        # Verify that the object which arrived at the target is still the
+        # object captured during planning. This cannot eliminate every hostile
+        # TOCTOU race, but it catches accidental external replacement.
+        if not same_identity(plan.target, plan.source_identity):
+            raise RuntimeError(
+                f"renamed target identity mismatch: {plan.target}"
+            )
+
+        if fsync_dir:
+            fsync_directory(plan.target.parent)
+
         return RenameResult(
             plan.source,
             plan.target,
@@ -708,6 +826,7 @@ def process_directory(
     workers: int,
     backup: bool,
     fsync_backup: bool,
+    fsync_dir: bool,
     include_hidden: bool,
     follow_directory_symlinks: bool,
     max_attempts: int,
@@ -790,6 +909,7 @@ def process_directory(
                     execute_plan,
                     plan,
                     fsync_backup=fsync_backup,
+                    fsync_dir=fsync_dir,
                 )
                 futures[future] = plan
 
@@ -908,6 +1028,11 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="fsync backup contents before rename (slower, stronger durability)",
     )
     parser.add_argument(
+        "--fsync-directory",
+        action="store_true",
+        help="fsync the containing directory after each successful rename on POSIX",
+    )
+    parser.add_argument(
         "--replacement",
         type=validate_replacement,
         default="_",
@@ -950,7 +1075,7 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "treat case-only paths as distinct during planning; "
-            "unsafe on normal Windows directories"
+            "unsafe on normal Windows and macOS default filesystems"
         ),
     )
     parser.add_argument(
@@ -1007,7 +1132,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         normalize_unicode=not args.no_unicode_normalize,
         preserve_leading_dot=args.preserve_leading_dot,
         case_insensitive_collisions=(
-            os.name == "nt" and not args.case_sensitive_collisions
+            (os.name == "nt" or sys.platform == "darwin")
+            and not args.case_sensitive_collisions
         ),
     )
 
@@ -1021,6 +1147,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             workers=args.threads,
             backup=args.backup,
             fsync_backup=args.fsync_backup,
+            fsync_dir=args.fsync_directory,
             include_hidden=args.include_hidden,
             follow_directory_symlinks=args.follow_directory_symlinks,
             max_attempts=args.max_attempts,
