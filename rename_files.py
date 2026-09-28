@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-File Sanitizer v4 — safer deterministic batch filename sanitizer.
+File Sanitizer v5 — race-hardened deterministic batch filename sanitizer.
 
 Main guarantees:
 - never intentionally overwrites an existing path;
@@ -8,6 +8,7 @@ Main guarantees:
 - original filenames, rename targets, and backup paths are reserved together;
 - broken symlinks count as occupied destinations;
 - regular-file identity is captured during planning and checked again before rename;
+- backups are copied from a verified open file descriptor and source mutation is detected;
 - filename limits are enforced by characters and, on POSIX, filesystem byte limits;
 - supports recursion, extension filters, backups, parallel execution, and Ctrl+C;
 - Windows reserved names / trailing spaces and dots are handled portably;
@@ -38,7 +39,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Sequence
+from typing import BinaryIO, Iterable, Iterator, Optional, Sequence
 
 try:
     from tqdm import tqdm
@@ -319,8 +320,7 @@ def collision_key(path: Path, case_insensitive: bool) -> str:
     return value.casefold() if case_insensitive else value
 
 
-def capture_identity(path: Path) -> FileIdentity:
-    st = path.stat(follow_symlinks=False)
+def identity_from_stat(st: os.stat_result) -> FileIdentity:
     return FileIdentity(
         device=st.st_dev,
         inode=st.st_ino,
@@ -330,11 +330,11 @@ def capture_identity(path: Path) -> FileIdentity:
     )
 
 
-def same_identity(path: Path, expected: FileIdentity) -> bool:
-    try:
-        actual = capture_identity(path)
-    except OSError:
-        return False
+def capture_identity(path: Path) -> FileIdentity:
+    return identity_from_stat(path.stat(follow_symlinks=False))
+
+
+def same_identity_value(actual: FileIdentity, expected: FileIdentity) -> bool:
     return (
         actual.device == expected.device
         and actual.inode == expected.inode
@@ -342,6 +342,14 @@ def same_identity(path: Path, expected: FileIdentity) -> bool:
         and actual.size == expected.size
         and actual.mtime_ns == expected.mtime_ns
     )
+
+
+def same_identity(path: Path, expected: FileIdentity) -> bool:
+    try:
+        actual = capture_identity(path)
+    except OSError:
+        return False
+    return same_identity_value(actual, expected)
 
 
 def _same_file(first: Path, second: Path) -> bool:
@@ -450,7 +458,8 @@ def iter_files(
                     continue
                 visited_dirs.add(directory_id)
 
-            with os.scandir(current) as entries:
+            with os.scandir(current) as scan:
+                entries = sorted(scan, key=lambda entry: entry.name.casefold())
                 for entry in entries:
                     if STOP_EVENT.is_set():
                         return
@@ -582,41 +591,57 @@ def build_plan(
     return plans
 
 
+def _verify_open_source(src: BinaryIO, expected: FileIdentity) -> None:
+    actual = identity_from_stat(os.fstat(src.fileno()))
+    if not stat.S_ISREG(actual.mode):
+        raise RuntimeError("opened source is no longer a regular file")
+    if not same_identity_value(actual, expected):
+        raise RuntimeError("opened source does not match the file captured during planning")
+
+
 def copy_backup_exclusive(
     source: Path,
     target: Path,
     *,
+    expected_identity: FileIdentity,
     fsync_backup: bool,
 ) -> Path:
-    """
-    Copy a backup to an already-planned unique path using exclusive creation.
+    """Create an exclusive backup from the exact file object planned earlier.
 
-    Exclusive 'xb' protects against an external process creating the same path
-    after planning.
+    The source descriptor is verified before and after copying. This closes the
+    path-open race present in a pathname-only copy and detects in-place changes
+    to size or mtime while a long backup is being produced.
     """
     try:
-        with source.open("rb") as src, target.open("xb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 1024)
+        with source.open("rb") as src:
+            _verify_open_source(src, expected_identity)
 
-            # Apply metadata before the optional fsync so durability includes
-            # the metadata changes made by copystat as far as the platform
-            # permits.
+            with target.open("xb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                if fsync_backup:
+                    os.fsync(dst.fileno())
+
+            _verify_open_source(src, expected_identity)
+
+        # Metadata is non-essential to backup correctness. Copy it only after
+        # the content has been safely written; failure is deliberately soft.
+        try:
+            shutil.copystat(source, target, follow_symlinks=False)
+        except OSError:
+            LOGGER.debug("Could not copy all metadata to %s", target, exc_info=True)
+
+        if fsync_backup:
+            # copystat may have changed durable metadata after the first fsync.
+            fd = os.open(target, os.O_RDONLY)
             try:
-                shutil.copystat(source, target, follow_symlinks=False)
-            except OSError:
-                LOGGER.debug(
-                    "Could not copy all metadata to %s",
-                    target,
-                    exc_info=True,
-                )
-
-            dst.flush()
-            if fsync_backup:
-                os.fsync(dst.fileno())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
         return target
 
-    except Exception:
+    except BaseException:
         try:
             target.unlink(missing_ok=True)
         except OSError:
@@ -776,6 +801,7 @@ def execute_plan(
             backup_path = copy_backup_exclusive(
                 plan.source,
                 plan.backup_target,
+                expected_identity=plan.source_identity,
                 fsync_backup=fsync_backup,
             )
 
@@ -1099,6 +1125,8 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     if args.max_length < 16:
         parser.error("--max-length must be at least 16")
+    if args.max_length > 32_767:
+        parser.error("--max-length is unreasonably large (maximum: 32767)")
 
     if args.fsync_backup and not args.backup:
         parser.error("--fsync-backup requires --backup")
