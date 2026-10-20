@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-File Sanitizer v5 — race-hardened deterministic batch filename sanitizer.
+File Sanitizer v6 — race-hardened deterministic batch filename sanitizer.
 
 Main guarantees:
 - never intentionally overwrites an existing path;
@@ -13,7 +13,7 @@ Main guarantees:
 - supports recursion, extension filters, backups, parallel execution, and Ctrl+C;
 - Windows reserved names / trailing spaces and dots are handled portably;
 - planning order is deterministic even if os.scandir() order is not;
-- Linux uses atomic renameat2(RENAME_NOREPLACE) when available;
+- Linux and macOS use atomic no-replace renames when available;
 - optional directory fsync can make completed renames more crash-durable.
 
 Python: 3.9+
@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import unicodedata
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -288,7 +288,14 @@ def sanitize_filename(name: str, cfg: SanitizerConfig, directory: Path) -> str:
             f"(?:{re.escape(cfg.replacement)})+",
             cfg.replacement,
             working,
-        ).strip(cfg.replacement)
+        )
+        # str.strip(value) treats value as a *set of characters*, not a
+        # literal substring. That silently removed unrelated characters for
+        # multi-character replacements such as "ab".
+        while working.startswith(cfg.replacement):
+            working = working[len(cfg.replacement):]
+        while working.endswith(cfg.replacement):
+            working = working[:-len(cfg.replacement)]
 
     # Portable Windows-compatible output.
     working = working.rstrip(" .")
@@ -308,6 +315,18 @@ def sanitize_filename(name: str, cfg: SanitizerConfig, directory: Path) -> str:
         prefix="." if leading_dot else "",
     )
 
+    # Truncation can itself create a reserved Windows device name: e.g.
+    # "CONfiguration.123456789012" can become "CON.123456789012".
+    # Recheck the *finished* component, not just the original stem.
+    final_stem, final_suffix = split_filename(result)
+    if is_windows_reserved_stem(final_stem):
+        result = fit_filename(
+            f"_{final_stem}",
+            final_suffix,
+            directory=directory,
+            max_chars=cfg.max_length,
+        )
+
     # A final portable cleanup in case truncation exposed an odd edge case.
     result = result.rstrip(" .")
     if result in {"", ".", ".."}:
@@ -317,7 +336,9 @@ def sanitize_filename(name: str, cfg: SanitizerConfig, directory: Path) -> str:
 
 def collision_key(path: Path, case_insensitive: bool) -> str:
     value = os.path.abspath(os.fspath(path))
-    return value.casefold() if case_insensitive else value
+    # Case-insensitive macOS volumes also commonly fold canonically
+    # equivalent Unicode spellings; reserve both spellings conservatively.
+    return unicodedata.normalize("NFD", value).casefold() if case_insensitive else value
 
 
 def identity_from_stat(st: os.stat_result) -> FileIdentity:
@@ -352,13 +373,6 @@ def same_identity(path: Path, expected: FileIdentity) -> bool:
     return same_identity_value(actual, expected)
 
 
-def _same_file(first: Path, second: Path) -> bool:
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def candidate_name(
     base_name: str,
     index: int,
@@ -383,7 +397,6 @@ def reserve_unique_path(
     reserved: set[str],
     cfg: SanitizerConfig,
     max_attempts: int,
-    allow_same_source: bool,
 ) -> Path:
     directory = source.parent
 
@@ -401,8 +414,9 @@ def reserve_unique_path(
         candidate = source.with_name(name)
         key = collision_key(candidate, cfg.case_insensitive_collisions)
 
-        if allow_same_source and _same_file(source, candidate):
-            return candidate
+        # An existing hard link to the source is still an occupied name.
+        # Never exempt it from collision checking just because samefile() is
+        # true: a no-overwrite rename would fail, or could be unsafe.
         if key in reserved:
             continue
         if path_lexists(candidate):
@@ -557,26 +571,36 @@ def build_plan(
             stats.unchanged += 1
             continue
 
-        target = reserve_unique_path(
-            source,
-            desired_name,
-            reserved=reserved,
-            cfg=cfg,
-            max_attempts=max_attempts,
-            allow_same_source=True,
-        )
-
-        backup_target: Optional[Path] = None
-        if backup:
-            backup_name = make_backup_basename(source, cfg)
-            backup_target = reserve_unique_path(
+        # Reserve the rename target and optional backup as one transaction.
+        # If allocating the backup fails, release the unused rename target
+        # and continue with other files instead of aborting the whole batch.
+        allocated: list[str] = []
+        try:
+            target = reserve_unique_path(
                 source,
-                backup_name,
+                desired_name,
                 reserved=reserved,
                 cfg=cfg,
                 max_attempts=max_attempts,
-                allow_same_source=False,
             )
+            allocated.append(collision_key(target, cfg.case_insensitive_collisions))
+
+            backup_target: Optional[Path] = None
+            if backup:
+                backup_name = make_backup_basename(source, cfg)
+                backup_target = reserve_unique_path(
+                    source,
+                    backup_name,
+                    reserved=reserved,
+                    cfg=cfg,
+                    max_attempts=max_attempts,
+                )
+                allocated.append(collision_key(backup_target, cfg.case_insensitive_collisions))
+        except (OSError, ValueError) as exc:
+            reserved.difference_update(allocated)
+            stats.failed += 1
+            LOGGER.error("%sCould not plan %s | %s", Fore.RED, source, exc)
+            continue
 
         plans.append(
             RenamePlan(
@@ -599,6 +623,19 @@ def _verify_open_source(src: BinaryIO, expected: FileIdentity) -> None:
         raise RuntimeError("opened source does not match the file captured during planning")
 
 
+def _same_file_object(path: Path, identity: FileIdentity) -> bool:
+    """Check the inode, not mutable size/mtime, for safe cleanup."""
+    try:
+        current = capture_identity(path)
+    except OSError:
+        return False
+    return (
+        current.device == identity.device
+        and current.inode == identity.inode
+        and stat.S_IFMT(current.mode) == stat.S_IFMT(identity.mode)
+    )
+
+
 def copy_backup_exclusive(
     source: Path,
     target: Path,
@@ -606,35 +643,53 @@ def copy_backup_exclusive(
     expected_identity: FileIdentity,
     fsync_backup: bool,
 ) -> Path:
-    """Create an exclusive backup from the exact file object planned earlier.
+    """Copy from a verified descriptor to a newly created, exclusive backup.
 
-    The source descriptor is verified before and after copying. This closes the
-    path-open race present in a pathname-only copy and detects in-place changes
-    to size or mtime while a long backup is being produced.
+    Cleanup only removes a backup we actually created. In particular, an
+    exclusive-open failure must NEVER unlink somebody else's existing file.
     """
+    created_identity: Optional[FileIdentity] = None
     try:
-        with source.open("rb") as src:
+        # O_NOFOLLOW blocks pathname substitution with a symlink on POSIX.
+        # Descriptor and pathname identity are also checked on other systems.
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(source, flags)
+        with os.fdopen(fd, "rb") as src:
             _verify_open_source(src, expected_identity)
+            if not same_identity(source, expected_identity):
+                raise RuntimeError("source path changed before backup copy")
 
             with target.open("xb") as dst:
+                created_identity = identity_from_stat(os.fstat(dst.fileno()))
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
                 dst.flush()
                 if fsync_backup:
                     os.fsync(dst.fileno())
 
             _verify_open_source(src, expected_identity)
+            if not same_identity(source, expected_identity):
+                raise RuntimeError("source path changed during backup copy")
 
-        # Metadata is non-essential to backup correctness. Copy it only after
-        # the content has been safely written; failure is deliberately soft.
-        try:
-            shutil.copystat(source, target, follow_symlinks=False)
-        except OSError:
-            LOGGER.debug("Could not copy all metadata to %s", target, exc_info=True)
+        if not _same_file_object(target, created_identity):
+            raise RuntimeError("backup target was replaced during creation")
+
+        # Metadata is optional. Do not allow a missing or swapped source to
+        # silently become the source of metadata for the verified backup.
+        if same_identity(source, expected_identity):
+            try:
+                shutil.copystat(source, target, follow_symlinks=False)
+            except OSError:
+                LOGGER.debug("Could not copy all metadata to %s", target, exc_info=True)
 
         if fsync_backup:
-            # copystat may have changed durable metadata after the first fsync.
-            fd = os.open(target, os.O_RDONLY)
+            # Metadata was changed after the content fsync. Verify the file
+            # object reopened at the destination before syncing it again.
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(target, flags)
             try:
+                st = os.fstat(fd)
+                if (st.st_dev, st.st_ino) != (created_identity.device, created_identity.inode):
+                    raise RuntimeError("backup target changed before final fsync")
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -642,10 +697,11 @@ def copy_backup_exclusive(
         return target
 
     except BaseException:
-        try:
-            target.unlink(missing_ok=True)
-        except OSError:
-            LOGGER.exception("Could not remove incomplete backup: %s", target)
+        if created_identity is not None and _same_file_object(target, created_identity):
+            try:
+                target.unlink()
+            except OSError:
+                LOGGER.exception("Could not remove incomplete backup: %s", target)
         raise
 
 
@@ -658,56 +714,80 @@ def link_then_unlink(source: Path, target: Path) -> None:
     renameat2(RENAME_NOREPLACE).
     """
     os.link(source, target, follow_symlinks=False)
+    # If another process replaces the source between link and unlink, do not
+    # knowingly delete the new source. We cannot eliminate this race entirely
+    # without a native atomic no-overwrite rename primitive.
+    linked_identity = capture_identity(target)
     try:
+        if not _same_file_object(source, linked_identity):
+            raise RuntimeError("source changed during hard-link rename fallback")
         source.unlink()
-    except Exception:
-        try:
-            target.unlink()
-        except OSError:
-            LOGGER.critical(
-                "Rollback failed; both names may exist: %s and %s",
-                source,
-                target,
-            )
+    except BaseException:
+        # Never delete a destination belonging to a different file if another
+        # process replaced the temporary hard link while we were working.
+        if _same_file_object(target, linked_identity):
+            try:
+                target.unlink()
+            except OSError:
+                LOGGER.critical(
+                    "Rollback failed; both names may exist: %s and %s",
+                    source,
+                    target,
+                )
+        else:
+            LOGGER.critical("Rollback skipped: destination changed externally: %s", target)
         raise
 
 
-_RENAMEAT2_UNAVAILABLE_ERRNOS = {
+_NATIVE_RENAME_UNAVAILABLE = {
     errno.ENOSYS,
     errno.EINVAL,
     errno.EOPNOTSUPP,
     getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
 }
 _RENAME_NOREPLACE = 1
+_DARWIN_RENAME_EXCL = 0x00000004
 _AT_FDCWD = -100
 
 
-def linux_rename_noreplace(source: Path, target: Path) -> bool:
-    """
-    Attempt Linux renameat2(..., RENAME_NOREPLACE).
-
-    Return True on success and False only when the API/filesystem does not
-    support the operation. Other errors are propagated.
-    """
-    if not sys.platform.startswith("linux"):
-        return False
-
+@lru_cache(maxsize=1)
+def _linux_renameat2():
+    """Cache the ctypes entry point instead of reopening libc per file."""
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        renameat2 = libc.renameat2
+        func = ctypes.CDLL(None, use_errno=True).renameat2
     except (AttributeError, OSError):
-        return False
-
-    renameat2.argtypes = [
+        return None
+    func.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_uint,
     ]
-    renameat2.restype = ctypes.c_int
+    func.restype = ctypes.c_int
+    return func
 
-    result = renameat2(
+
+@lru_cache(maxsize=1)
+def _darwin_renamex_np():
+    try:
+        func = ctypes.CDLL(None, use_errno=True).renamex_np
+    except (AttributeError, OSError):
+        return None
+    func.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    func.restype = ctypes.c_int
+    return func
+
+
+def linux_rename_noreplace(source: Path, target: Path) -> bool:
+    """Use atomic renameat2(RENAME_NOREPLACE) when supported on Linux."""
+    if not sys.platform.startswith("linux"):
+        return False
+
+    func = _linux_renameat2()
+    if func is None:
+        return False
+    result = func(
         _AT_FDCWD,
         os.fsencode(source),
         _AT_FDCWD,
@@ -718,7 +798,24 @@ def linux_rename_noreplace(source: Path, target: Path) -> bool:
         return True
 
     error = ctypes.get_errno()
-    if error in _RENAMEAT2_UNAVAILABLE_ERRNOS:
+    if error in _NATIVE_RENAME_UNAVAILABLE:
+        return False
+    raise OSError(error, os.strerror(error), os.fspath(source), os.fspath(target))
+
+
+def darwin_rename_noreplace(source: Path, target: Path) -> bool:
+    """Use atomic renamex_np(RENAME_EXCL) when supported on macOS."""
+    if sys.platform != "darwin":
+        return False
+
+    func = _darwin_renamex_np()
+    if func is None:
+        return False
+    if func(os.fsencode(source), os.fsencode(target), _DARWIN_RENAME_EXCL) == 0:
+        return True
+
+    error = ctypes.get_errno()
+    if error in _NATIVE_RENAME_UNAVAILABLE:
         return False
     raise OSError(error, os.strerror(error), os.fspath(source), os.fspath(target))
 
@@ -730,7 +827,7 @@ def rename_no_overwrite(source: Path, target: Path) -> None:
         os.rename(source, target)
         return
 
-    if linux_rename_noreplace(source, target):
+    if linux_rename_noreplace(source, target) or darwin_rename_noreplace(source, target):
         return
 
     try:
@@ -781,6 +878,7 @@ def execute_plan(
         )
 
     backup_path: Optional[Path] = None
+    renamed = False
 
     try:
         if not same_identity(plan.source, plan.source_identity):
@@ -788,7 +886,7 @@ def execute_plan(
                 f"source changed, disappeared, or was replaced after planning: {plan.source}"
             )
 
-        if path_lexists(plan.target) and not _same_file(plan.source, plan.target):
+        if path_lexists(plan.target):
             raise FileExistsError(
                 f"destination appeared after planning: {plan.target}"
             )
@@ -812,7 +910,12 @@ def execute_plan(
                     f"source changed while backup was being created: {plan.source}"
                 )
 
+        # A final pathname check narrows (but cannot fully eliminate) the
+        # source-replacement window before the no-overwrite operation.
+        if not same_identity(plan.source, plan.source_identity):
+            raise RuntimeError(f"source changed immediately before rename: {plan.source}")
         rename_no_overwrite(plan.source, plan.target)
+        renamed = True
 
         # Verify that the object which arrived at the target is still the
         # object captured during planning. This cannot eliminate every hostile
@@ -836,7 +939,9 @@ def execute_plan(
         return RenameResult(
             plan.source,
             plan.target,
-            renamed=False,
+            # An error after the rename (e.g. directory fsync failure) does
+            # not undo the move. Report both the completed move and the error.
+            renamed=renamed,
             backup_path=backup_path,
             error=str(exc),
         )
@@ -920,75 +1025,97 @@ def process_directory(
     )
 
     futures: dict[Future[RenameResult], RenamePlan] = {}
+    submitted = 0
+    plan_iter = iter(plans)
 
     try:
         with ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix="sanitize",
         ) as executor:
-            for plan in plans:
-                if STOP_EVENT.is_set():
-                    stats.cancelled += 1
-                    continue
-
-                future = executor.submit(
-                    execute_plan,
-                    plan,
-                    fsync_backup=fsync_backup,
-                    fsync_dir=fsync_dir,
-                )
-                futures[future] = plan
-
-            for future in as_completed(futures):
-                plan = futures[future]
-
-                try:
-                    result = future.result()
-                except BaseException as exc:
-                    stats.failed += 1
-                    LOGGER.exception(
-                        "%sWorker crashed: %s → %s | %s",
-                        Fore.RED,
-                        plan.source,
-                        plan.target.name,
-                        exc,
+            # Keep the executor queue bounded, even for very large batches.
+            # This also prevents scheduling thousands of operations after a
+            # cancellation signal has already been received.
+            def fill_queue() -> None:
+                nonlocal submitted
+                while len(futures) < workers * 2 and not STOP_EVENT.is_set():
+                    try:
+                        plan = next(plan_iter)
+                    except StopIteration:
+                        return
+                    future = executor.submit(
+                        execute_plan,
+                        plan,
+                        fsync_backup=fsync_backup,
+                        fsync_dir=fsync_dir,
                     )
+                    futures[future] = plan
+                    submitted += 1
+
+            fill_queue()
+            while futures:
+                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    plan = futures.pop(future)
+                    try:
+                        result = future.result()
+                    except BaseException as exc:
+                        stats.failed += 1
+                        LOGGER.error(
+                            "%sWorker crashed: %s → %s | %s",
+                            Fore.RED,
+                            plan.source,
+                            plan.target.name,
+                            exc,
+                            exc_info=True,
+                        )
+                        if progress:
+                            progress.update(1)
+                        continue
+
+                    if result.renamed:
+                        stats.renamed += 1
+                        LOGGER.info(
+                            "%sRenamed: %s → %s%s",
+                            Fore.GREEN,
+                            result.source.name,
+                            result.target.name,
+                            (
+                                f" | backup: {result.backup_path.name}"
+                                if result.backup_path
+                                else ""
+                            ),
+                        )
+                        if result.error:
+                            stats.failed += 1
+                            LOGGER.error(
+                                "%sPost-rename error: %s | %s",
+                                Fore.RED,
+                                result.target,
+                                result.error,
+                            )
+                    elif result.error == "cancelled":
+                        stats.cancelled += 1
+                        LOGGER.warning("%sCancelled: %s", Fore.YELLOW, result.source)
+                    else:
+                        stats.failed += 1
+                        LOGGER.error(
+                            "%sFailed: %s → %s | %s",
+                            Fore.RED,
+                            result.source,
+                            result.target.name,
+                            result.error or "unknown error",
+                        )
+
                     if progress:
                         progress.update(1)
-                    continue
+                fill_queue()
 
-                if result.renamed:
-                    stats.renamed += 1
-                    LOGGER.info(
-                        "%sRenamed: %s → %s%s",
-                        Fore.GREEN,
-                        result.source.name,
-                        result.target.name,
-                        (
-                            f" | backup: {result.backup_path.name}"
-                            if result.backup_path
-                            else ""
-                        ),
-                    )
-                elif result.error == "cancelled":
-                    stats.cancelled += 1
-                    LOGGER.warning(
-                        "%sCancelled: %s",
-                        Fore.YELLOW,
-                        result.source,
-                    )
-                else:
-                    stats.failed += 1
-                    LOGGER.error(
-                        "%sFailed: %s → %s | %s",
-                        Fore.RED,
-                        result.source,
-                        result.target.name,
-                        result.error or "unknown error",
-                    )
-
+            if STOP_EVENT.is_set():
+                not_submitted = len(plans) - submitted
+                stats.cancelled += not_submitted
                 if progress:
-                    progress.update(1)
+                    progress.update(not_submitted)
 
     finally:
         if progress:
